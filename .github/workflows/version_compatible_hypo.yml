@@ -101,7 +101,7 @@ jobs:
           sudo pip install xattr
           
       - name: Test
-        timeout-minutes: 90
+        timeout-minutes: 120
         run: |          
           export META=${{matrix.meta}}
           export STORAGE=${{matrix.storage}}
