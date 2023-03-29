@@ -77,7 +77,7 @@ jobs:
 
       - name: Esrally Test
         run: |
-          sudo pip3 install esrally
+          sudo pip3 install esrally==2.7.0
           sudo .github/scripts/apt_install.sh pbzip2
           esrally race --track=geopoint --target-hosts=127.0.0.1:9200 --pipeline=benchmark-only --report-file=/tmp/report.md
           cat /tmp/report.md
