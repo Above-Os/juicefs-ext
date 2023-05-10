@@ -31,6 +31,7 @@ require (
 	github.com/hashicorp/go-hclog v1.2.0
 	github.com/huaweicloud/huaweicloud-sdk-go-obs v3.21.12+incompatible
 	github.com/hungys/go-lz4 v0.0.0-20170805124057-19ff7f07f099
+	github.com/james-barrow/golang-ipc v1.0.0
 	github.com/jcmturner/gokrb5/v8 v8.4.2
 	github.com/juicedata/godaemon v0.0.0-20210629045518-3da5144a127d
 	github.com/juju/ratelimit v1.0.1
@@ -83,6 +84,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v0.21.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v0.8.3 // indirect
 	github.com/Azure/go-ntlmssp v0.0.0-20200615164410-66371956d46c // indirect
+	github.com/Microsoft/go-winio v0.4.16 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect

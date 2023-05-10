@@ -428,7 +428,9 @@ func Serve(v *vfs.VFS, options string, xattrs bool) error {
 	}
 
 	conf := v.Conf
-	imp := newFileSystem(conf, v)
+	done := make(chan struct{})
+	defer close(done)
+	imp := withHook(newFileSystem(conf, v), withNotify(newFuseHook(v, meta.Background), done))
 
 	var opt fuse.MountOptions
 	opt.FsName = "JuiceFS:" + conf.Format.Name
