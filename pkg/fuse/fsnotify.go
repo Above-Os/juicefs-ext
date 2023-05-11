@@ -17,6 +17,7 @@ package fuse
 import (
 	"encoding/binary"
 	"strings"
+	"time"
 	"unsafe"
 
 	ipc "github.com/james-barrow/golang-ipc"
@@ -77,8 +78,45 @@ const (
 
 const (
 	MSG_ERROR = iota
+
+	// message data:
+	// {
+	// 	byte[255] // watcher name
+	// 	byte[255][] // path array
+	// }
 	MSG_WATCH
+
+	// message data:
+	// {
+	// 	byte[255] // watcher name
+	// 	byte[255][] // path array
+	// }
 	MSG_UNWATCH
+
+	// message data:
+	// {
+	// 	byte[255] // watcher name
+	// }
+	MSG_CLEAR
+
+	// message data:
+	// {
+	// 	byte[255] // watcher name
+	// }
+	MSG_SUSPEND
+
+	// message data:
+	// {
+	// 	byte[255] // watcher name
+	// }
+	MSG_RESUME
+
+	// message data:
+	// {
+	// 	byte[255] // path
+	//  int32 // op
+	//  byte[255] // key
+	// }[] // event array
 	MSG_EVENT
 )
 
@@ -127,7 +165,12 @@ func withNotify(hook *fuseHook, close <-chan struct{}) *fuseHook {
 			offset += meta.MaxName
 		}
 
-		return paths
+		// FIXME: support multi-client
+		if len(paths) <= 1 {
+			return []string{}
+		}
+
+		return paths[1:]
 	}
 
 	n := &notifyServer{
@@ -137,6 +180,12 @@ func withNotify(hook *fuseHook, close <-chan struct{}) *fuseHook {
 				hook.addWatch(getPaths(msg))
 			case MSG_UNWATCH:
 				hook.unwatch(getPaths(msg))
+			case MSG_SUSPEND:
+				hook.suspend()
+			case MSG_RESUME:
+				hook.resume()
+			case MSG_CLEAR:
+				hook.clearWatch()
 			}
 		},
 		evenQ: make(chan Event, 4096),
@@ -168,6 +217,7 @@ type notifyServer struct {
 	closed  bool
 }
 
+// watch server currently supports just one to one ipc
 func (n *notifyServer) serve() {
 	sc, err := ipc.StartServer("JuiceFS-IPC", nil)
 	if err != nil {
@@ -191,6 +241,21 @@ func (n *notifyServer) serve() {
 
 			} else {
 				logger.Error("IPC Server error, ", err)
+
+				// network broken, suspend watcher
+				if n.handler != nil {
+					n.handler(&ipc.Message{MsgType: MSG_SUSPEND})
+					logger.Debug("fs watcher is suspended")
+				}
+
+				for sc.StatusCode() != ipc.Connected {
+					time.Sleep(time.Millisecond * 500)
+				}
+
+				if n.handler != nil {
+					n.handler(&ipc.Message{MsgType: MSG_RESUME})
+					logger.Debug("fs watcher is resume")
+				}
 			}
 		}
 	}()

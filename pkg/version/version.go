@@ -27,9 +27,9 @@ var (
 	revision     = "$Format:%h$" // value is assigned in Makefile
 	revisionDate = "$Format:%as$"
 	ver          = Semver{
-		major:      1,
+		major:      11,
 		minor:      0,
-		patch:      4,
+		patch:      0,
 		preRelease: "",
 		build:      fmt.Sprintf("%s.%s", revisionDate, revision),
 	}

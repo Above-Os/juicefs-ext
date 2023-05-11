@@ -28,6 +28,7 @@ type fuseHook struct {
 	lock      sync.RWMutex
 	watchList map[string]int
 	notify    fsnotify
+	suspended bool
 }
 
 func newFuseHook(v *vfs.VFS, ctx meta.Context) *fuseHook {
@@ -71,7 +72,20 @@ func (o *fuseHook) matchPathName(i Ino, sub string) (path, key string) {
 }
 
 func (o *fuseHook) sendEventWithSubname(i Ino, subname string, op Op) {
-	if len(o.watchList) == 0 {
+	if func() bool {
+		o.lock.RLock()
+		defer o.lock.RUnlock()
+
+		if o.suspended {
+			return true
+		}
+
+		if len(o.watchList) == 0 {
+			return true
+		}
+
+		return false
+	}() {
 		return
 	}
 
@@ -103,4 +117,24 @@ func (o *fuseHook) unwatch(paths []string) {
 	for _, p := range paths {
 		delete(o.watchList, p)
 	}
+}
+
+func (o *fuseHook) clearWatch() {
+	for k := range o.watchList {
+		delete(o.watchList, k)
+	}
+}
+
+func (o *fuseHook) suspend() {
+	o.lock.Lock()
+	defer o.lock.Unlock()
+
+	o.suspended = true
+}
+
+func (o *fuseHook) resume() {
+	o.lock.Lock()
+	defer o.lock.Unlock()
+
+	o.suspended = false
 }
