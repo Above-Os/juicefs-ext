@@ -15,7 +15,9 @@
 package fuse
 
 import (
+	"bytes"
 	"encoding/binary"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -161,7 +163,7 @@ func withNotify(hook *fuseHook, close <-chan struct{}) *fuseHook {
 		n := len(msg.Data)
 		for offset < n {
 			strlen := min(n-offset, meta.MaxName)
-			paths = append(paths, string(msg.Data[offset:strlen]))
+			paths = append(paths, string(bytes.Trim(msg.Data[offset:offset+strlen], "\x00")))
 			offset += meta.MaxName
 		}
 
@@ -190,6 +192,7 @@ func withNotify(hook *fuseHook, close <-chan struct{}) *fuseHook {
 		},
 		evenQ: make(chan Event, 4096),
 		waitQ: make(chan struct{}, 100), // wake up write worker
+		done:  make(chan int),
 	}
 
 	n.serve()
@@ -210,21 +213,48 @@ type fsnotify interface {
 
 type notifyServer struct {
 	fsnotify
-	server  *ipc.Server
-	handler func(msg *ipc.Message)
-	evenQ   chan Event
-	waitQ   chan struct{}
-	closed  bool
+	server    *ipc.Server
+	handler   func(msg *ipc.Message)
+	evenQ     chan Event
+	waitQ     chan struct{}
+	closed    bool
+	done      chan int
+	suspended bool
 }
 
 // watch server currently supports just one to one ipc
 func (n *notifyServer) serve() {
-	sc, err := ipc.StartServer("JuiceFS-IPC", nil)
+	sc, err := ipc.StartServer("JuiceFS-IPC", &ipc.ServerConfig{Encryption: false})
 	if err != nil {
 		panic(err)
 	}
 
 	n.server = sc
+
+	go func() {
+		tick := time.NewTicker(500 * time.Millisecond)
+
+		for {
+			select {
+			case <-tick.C:
+				switch n.server.StatusCode() {
+				case ipc.Connected:
+					if n.handler != nil && n.suspended {
+						n.handler(&ipc.Message{MsgType: MSG_RESUME})
+						n.suspended = false
+					}
+				default:
+					if n.handler != nil && !n.suspended {
+						n.handler(&ipc.Message{MsgType: MSG_SUSPEND})
+						n.suspended = true
+					}
+				}
+			case <-n.done:
+				return
+			}
+
+		}
+	}()
 
 	// read
 	go func() {
@@ -233,7 +263,7 @@ func (n *notifyServer) serve() {
 
 			if err == nil {
 				if m.MsgType > 0 {
-					logger.Debug("Server recieved: "+string(m.Data)+" - Message type: ", m.MsgType)
+					logger.Debug("Server recieved: "+string(m.Data)+":"+strconv.Itoa(len(m.Data))+" - Message type: ", m.MsgType)
 					if n.handler != nil {
 						n.handler(m)
 					}
@@ -241,21 +271,18 @@ func (n *notifyServer) serve() {
 
 			} else {
 				logger.Error("IPC Server error, ", err)
+				sc.Close()
 
-				// network broken, suspend watcher
-				if n.handler != nil {
-					n.handler(&ipc.Message{MsgType: MSG_SUSPEND})
-					logger.Debug("fs watcher is suspended")
+				// recreate server for next loop
+				sc, err = ipc.StartServer("JuiceFS-IPC", nil)
+				if err != nil {
+					panic(err)
 				}
 
-				for sc.StatusCode() != ipc.Connected {
-					time.Sleep(time.Millisecond * 500)
-				}
+				n.server = sc
 
-				if n.handler != nil {
-					n.handler(&ipc.Message{MsgType: MSG_RESUME})
-					logger.Debug("fs watcher is resume")
-				}
+				logger.Info("IPC Server recreated")
+
 			}
 		}
 	}()
@@ -294,6 +321,7 @@ func (n *notifyServer) close() {
 	n.server.Close()
 	close(n.evenQ)
 	close(n.waitQ)
+	close(n.done)
 	n.closed = true
 }
 
@@ -311,7 +339,7 @@ func (n *notifyServer) packageMsgData(events []Event) []byte {
 		offset += meta.MaxName
 
 		data = ([]byte)(unsafe.Slice(&frame[offset], 4))
-		binary.LittleEndian.PutUint32(data, uint32(e.Op))
+		binary.BigEndian.PutUint32(data, uint32(e.Op))
 		offset += 4
 
 		data = ([]byte)(unsafe.Slice(&frame[offset], meta.MaxName))

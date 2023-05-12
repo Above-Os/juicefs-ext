@@ -16,6 +16,8 @@ package fuse
 
 import (
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -43,32 +45,50 @@ func (o *fuseHook) sendEvent(i Ino, op Op) {
 	o.sendEventWithSubname(i, "", op)
 }
 
-func (o *fuseHook) matchPathName(i Ino, sub string) (path, key string) {
+func (o *fuseHook) matchPathNames(i Ino, s string) [][]string {
 	paths := meta.GetPaths(o.v.Meta, o.ctx, i)
-	if sub != "" {
-		paths = append(paths, sub)
+
+	matchPath := func(paths []string, sub string) (p, k string) {
+		if sub != "" {
+			paths = append(paths, sub)
+		}
+
+		try := len(paths)
+
+		var (
+			ok bool
+		)
+
+		o.lock.RLock()
+		for try > 0 {
+			k = filepath.Clean(o.v.Conf.Meta.MountPoint + "/" + filepath.Join(paths[:try]...))
+			logger.Debug("match path, [", k, " try ", strconv.Itoa(try))
+			if _, ok = o.watchList[k]; ok {
+				break
+			}
+
+			try--
+		}
+		o.lock.RUnlock()
+
+		if !ok {
+			return "", ""
+		}
+
+		p = filepath.Join(paths...)
+
+		return filepath.Clean(o.v.Conf.Meta.MountPoint + "/" + p), k
 	}
 
-	try := len(paths)
-
-	var (
-		ok bool
-	)
-
-	o.lock.RLock()
-	for ; try > 0 && !ok; _, ok = o.watchList[filepath.Join(paths[:try]...)] {
-		try--
-	}
-	o.lock.RUnlock()
-
-	if !ok {
-		return "", ""
+	var ret [][]string
+	for _, p := range paths {
+		ptoken := strings.Split(p, string(filepath.Separator))
+		if p, k := matchPath(ptoken, s); p != "" && k != "" {
+			ret = append(ret, []string{p, k})
+		}
 	}
 
-	key = filepath.Join(paths[:try]...)
-	path = filepath.Join(paths...)
-
-	return o.v.Conf.Meta.MountPoint + path, key
+	return ret
 }
 
 func (o *fuseHook) sendEventWithSubname(i Ino, subname string, op Op) {
@@ -89,15 +109,18 @@ func (o *fuseHook) sendEventWithSubname(i Ino, subname string, op Op) {
 		return
 	}
 
-	path, watchKey := o.matchPathName(i, subname)
+	ret := o.matchPathNames(i, subname)
+	for _, r := range ret {
+		path, watchKey := r[0], r[1]
 
-	if watchKey != "" {
-		logger.Debug("send event to pipe, ", i, " , ", path, " , ", op)
-		o.notify.notify(Event{
-			Name:     path,
-			Op:       op,
-			WatchKey: watchKey,
-		})
+		if watchKey != "" {
+			logger.Debug("send event to pipe, ", i, " , ", path, " , ", op)
+			o.notify.notify(Event{
+				Name:     path,
+				Op:       op,
+				WatchKey: watchKey,
+			})
+		}
 	}
 }
 
@@ -106,6 +129,7 @@ func (o *fuseHook) addWatch(paths []string) {
 	defer o.lock.Unlock()
 
 	for _, p := range paths {
+		logger.Debug("add watch ", p)
 		o.watchList[p] = 1
 	}
 }
