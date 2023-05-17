@@ -3,13 +3,13 @@ name: verify
 on:
   push:
     branches:
-    - main
+    - ext-main
     - 'release-**'
     paths:
     - '**.go'
   pull_request:
     branches:
-    - 'main'
+    - 'ext-main'
     - 'release-**'
     paths:
     - '**.yml'

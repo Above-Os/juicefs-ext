@@ -14,57 +14,37 @@ jobs:
         with:
           go-version: '1.18.x'
 
-      - name: Set up Java
-        uses: actions/setup-java@v2
-        with:
-          distribution: 'adopt'
-          java-version: '8'
-          server-id: ossrh
-          server-username: MAVEN_USERNAME
-          server-password: MAVEN_PASSWORD
-          gpg-private-key: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
-          gpg-passphrase: MAVEN_GPG_PASSPHRASE
-
       - name: Checkout
         uses: actions/checkout@v2
         with:
           fetch-depth: 1
 
+      - name: get latest tag
+        uses: "WyriHaximus/github-action-get-previous-tag@v1"
+        id: get-latest-tag
+        with:
+          fallback: latest
+
       - name: setup release environment
         run: |-
-          echo 'GITHUB_TOKEN=${{secrets.GH_PERSONAL_ACCESS_TOKEN}}' > .release-env
+          echo 'GITHUB_TOKEN=${{secrets.GITHUB_TOKEN}}' > .release-env
 
-      - name: goreleaser release
-        run: make release
-
-      - name: Cache local Maven repository
-        id: cache-maven
-        uses: actions/cache@v2
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
-
-      - name: Chown go module cache
-        run: sudo chown -R $USER $HOME/go/pkg/mod
-
-      - name: Build SDK
+      - name: Build
         run: |
-          make -C sdk/java package-all && sudo chown -R $USER sdk/java/target
-          echo "JUICEFS_VERSION=$(mvn -f sdk/java/pom.xml help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_ENV
+          make juicefs.linux
 
-      - name: Upload SDK
-        uses: softprops/action-gh-release@v1
+      - name: Archives
+        run: |
+          mkdir -p /tmp/build
+          tar ./juicefs -zcvf /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz .
+  
+      - name: 'Release'
+        uses: djnicholson/release-action@v2.11
         with:
-          files: |
-            sdk/java/target/juicefs-hadoop-${{ env.JUICEFS_VERSION }}.jar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish package
-        run: mvn -f sdk/java/pom.xml deploy -DskipTests
-        env:
-          MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
-          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release-name: ${{ steps.get-latest-tag.outputs.tag }} Release
+          tag-name: ${{ steps.get-latest-tag.outputs.tag }}
+          asset-name: juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
+          file: /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
+  
+  
