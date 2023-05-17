@@ -39,12 +39,9 @@ jobs:
           tar -zcvf /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz ./juicefs
   
       - name: 'Release'
-        uses: djnicholson/release-action@v2.11
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          release-name: ${{ steps.get-latest-tag.outputs.tag }} Release
-          tag-name: ${{ steps.get-latest-tag.outputs.tag }}
-          asset-name: juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
-          file: /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
+          files: /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
   
   
