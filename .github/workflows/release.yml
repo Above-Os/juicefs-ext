@@ -36,7 +36,7 @@ jobs:
       - name: Archives
         run: |
           mkdir -p /tmp/build
-          tar ./juicefs -zcvf /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz .
+          tar -zcvf /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz ./juicefs
   
       - name: 'Release'
         uses: djnicholson/release-action@v2.11
