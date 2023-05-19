@@ -31,7 +31,7 @@ jobs:
 
       - name: Build
         run: |
-          make juicefs
+          make juicefs.linux
 
       - name: Archives
         run: |
