@@ -147,9 +147,10 @@ func (fs *fileSystemProxy) Write(cancel <-chan struct{}, input *fuse.WriteIn, da
 func (fs *fileSystemProxy) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
 	status := fs.RawFileSystem.Flush(cancel, input)
 
-	fs.canDo(status, func() {
-		fs.hook.sendEvent(Ino(input.NodeId), Write)
-	})
+	// openning file to read will flush too
+	// fs.canDo(status, func() {
+	// 	fs.hook.sendEvent(Ino(input.NodeId), Write)
+	// })
 	return status
 }
 
