@@ -40,17 +40,8 @@ import (
 
 func createTestVFS() (*VFS, object.ObjectStorage) {
 	mp := "/jfs"
-<<<<<<< HEAD
-	metaConf := &meta.Config{
-		Retries:    10,
-		Strict:     true,
-		MaxDeletes: 2,
-		MountPoint: mp,
-	}
-=======
 	metaConf := meta.DefaultConf()
 	metaConf.MountPoint = mp
->>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
 	m := meta.NewClient("memkv://", metaConf)
 	format := &meta.Format{
 		Name:        "test",
