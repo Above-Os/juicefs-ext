@@ -1,27 +1,41 @@
 ---
-sidebar_label: 安装
+title: 安装
 sidebar_position: 1
 slug: /installation
+pagination_prev: introduction/comparison/juicefs_vs_s3ql
+description: 本文介绍 JuiceFS 在 Linux、macOS 和 Windows 上的安装方法，包括一键安装、编译安装和容器化安装。
 ---
-
-# 安装
 
 JuiceFS 有良好的跨平台能力，支持在几乎所有主流架构的各类操作系统上运行，包括且不限于 Linux、macOS、Windows 等。
 
 JuiceFS 客户端只有一个二进制文件，你可以下载预编译的版本直接解压使用，也可以用源代码手动编译。
 
-## 安装预编译客户端
+## 一键安装 {#one-click-installation}
+
+一键安装脚本适用于 Linux 和 macOS 系统，会根据你的硬件架构自动下载安装最新版 JuiceFS 客户端。
+
+```shell
+# 默认安装到 /usr/local/bin
+curl -sSL https://d.juicefs.com/install | sh -
+```
+
+```shell
+# 安装到 /tmp 目录下
+curl -sSL https://d.juicefs.com/install | sh -s /tmp
+```
+
+## 安装预编译客户端 {#install-the-pre-compiled-client}
 
 你可以在 [GitHub](https://github.com/juicedata/juicefs/releases) 找到最新版客户端下载地址，每个版本的下载列表中都提供了面向不同 CPU 架构和操作系统的预编译版本，请注意识别选择，例如：
 
-| 文件名                               | 说明                                                                     |
-|--------------------------------------|--------------------------------------------------------------------------|
-| `juicefs-x.x.x-darwin-amd64.tar.gz`  | 面向 Intel 芯片的 macOS 系统                                             |
-| `juicefs-x.x.x-darwin-arm64.tar.gz`  | 面向 M1 系列芯片的 macOS 系统                                            |
-| `juicefs-x.x.x-linux-amd64.tar.gz`   | 面向 x86 架构 Linux 发行版                                               |
-| `juicefs-x.x.x-linux-arm64.tar.gz`   | 面向 ARM 架构的 Linux 发行版                                             |
-| `juicefs-x.x.x-windows-amd64.tar.gz` | 面向 x86 架构的 Windows 系统                                             |
-| `juicefs-hadoop-x.x.x-amd64.jar`     | 面向 x86 架构的 Hadoop Java SDK（同时支持 Linux、macOS 及 Windows 系统） |
+| 文件名                               | 说明                                                                            |
+|--------------------------------------|---------------------------------------------------------------------------------|
+| `juicefs-x.y.z-darwin-amd64.tar.gz`  | 面向 Intel 芯片的 macOS 系统                                                    |
+| `juicefs-x.y.z-darwin-arm64.tar.gz`  | 面向 M1 系列芯片的 macOS 系统                                                   |
+| `juicefs-x.y.z-linux-amd64.tar.gz`   | 面向 x86 架构 Linux 发行版                                                      |
+| `juicefs-x.y.z-linux-arm64.tar.gz`   | 面向 ARM 架构的 Linux 发行版                                                    |
+| `juicefs-x.y.z-windows-amd64.tar.gz` | 面向 x86 架构的 Windows 系统                                                    |
+| `juicefs-hadoop-x.y.z.jar`           | 面向 x86 和 ARM 架构的 Hadoop Java SDK（同时支持 Linux、macOS 及 Windows 系统） |
 
 ### Linux 发行版
 
@@ -57,12 +71,28 @@ JuiceFS 客户端只有一个二进制文件，你可以下载预编译的版本
 如果终端提示 `command not found`，可能是因为 `/usr/local/bin` 不在你的系统 `PATH` 环境变量中，可以执行 `echo $PATH` 查看系统设置了哪些可执行路径，根据返回结果选择一个恰当的路径，调整并重新执行第 4 步的安装命令。
 :::
 
+#### Ubuntu PPA
+
+JuiceFS 也提供 [PPA](https://launchpad.net/~juicefs) 仓库，可以方便地在 Ubuntu 系统上安装最新版的客户端。根据你的 CPU 架构选择对应的 PPA 仓库：
+
+- **x86 架构**：`ppa:juicefs/ppa`
+- **ARM 架构**：`ppa:juicefs/arm64`
+
+以 x86 架构的 Ubuntu 22.04 系统为例，执行以下命令。
+
+```shell
+sudo add-apt-repository ppa:juicefs/ppa
+sudo apt-get update
+sudo apt-get install juicefs
+```
+
 ### Windows 系统
 
-在 Windows 系统使用 JuiceFS 的方法有两种：
+在 Windows 系统安装 JuiceFS 有以下几种方法：
 
 1. [使用预编译的 Windows 客户端](#预编译的-windows-客户端)
-2. [在 WSL 中使用 Linux 版客户端](#在-wsl-中使用-linux-版客户端)
+2. [使用 Scoop 安装](#scoop)
+3. [在 WSL 中使用 Linux 版客户端](#在-wsl-中使用-linux-版客户端)
 
 #### 预编译的 Windows 客户端
 
@@ -84,6 +114,14 @@ JuiceFS 的 Windows 客户端也是一个独立的二进制程序，下载解压
 
    ![Windows ENV path](../images/windows-path.png)
 
+#### 使用 Scoop 安装 {#scoop}
+
+如果你的 Windows 系统中安装了 [Scoop](https://scoop.sh)，可以使用以下命令安装最新版的 JuiceFS 客户端：
+
+```shell
+scoop install juicefs
+```
+
 #### 在 WSL 中使用 Linux 版客户端
 
 [WSL](https://docs.microsoft.com/zh-cn/windows/wsl/about) 全称 Windows Subsystem for Linux，即 Windows 的 Linux 子系统，从 Windows 10 版本 2004 以上或 Windows 11 开始支持该功能。它可以让你在 Windows 系统中运行原生的 GNU/Linux 的大多数命令行工具、实用工具和应用程序且不会产生传统虚拟机或双启动设置开销。
@@ -92,7 +130,7 @@ JuiceFS 的 Windows 客户端也是一个独立的二进制程序，下载解压
 
 ### macOS 系统
 
-由于 macOS 默认不支持 FUSE 接口，需要先安装 [macFUSE](https://osxfuse.github.io/) 实现对 FUSE 的支持。
+由于 macOS 默认不支持 FUSE 接口，需要先安装 [macFUSE](https://osxfuse.github.io) 实现对 FUSE 的支持。
 
 :::tip 提示
 [macFUSE](https://github.com/osxfuse/osxfuse) 是一个开源的文件系统增强工具，它让 macOS 可以挂载第三方的文件系统，使得 JuiceFS 客户端可以将文件系统挂载到 macOS 系统中使用。
@@ -100,12 +138,13 @@ JuiceFS 的 Windows 客户端也是一个独立的二进制程序，下载解压
 
 #### Homebrew 安装
 
-如果你的系统安装了 [Homebrew](https://brew.sh/) 包管理器，可以执行以下命令安装 JuiceFS 客户端：
+如果你的系统安装了 [Homebrew](https://brew.sh) 包管理器，可以执行以下命令安装 JuiceFS 客户端：
 
 ```shell
-brew tap juicedata/homebrew-tap
 brew install juicefs
 ```
+
+*请参考 [Homebrew Formulae](https://formulae.brew.sh/formula/juicefs#default) 页面了解命令详情。*
 
 #### 预编译二进制程序
 
@@ -143,9 +182,9 @@ RUN set -x && \
 CMD [ "juicefs" ]
 ```
 
-## 手动编译客户端
+## 手动编译客户端 {#manually-compiling}
 
-如果预编译的客户端中没有适用于你的版本，比如 FreeBSD 或 M1 芯片的 macOS，这时可以采用手动编译的方式编译适合你的 JuiceFS 客户端。
+如果预编译的客户端中没有适用于你的版本（比如 FreeBSD），这时可以采用手动编译的方式编译适合你的 JuiceFS 客户端。
 
 另外，手动编译客户端可以让你优先体验到 JuiceFS 开发中的各种新功能，但这需要你具备一定的软件编译相关的基础知识。
 
@@ -194,11 +233,15 @@ CMD [ "juicefs" ]
 
 ### 在 Windows 下编译
 
-在 Windows 系统中编译 JuiceFS 客户端，需要安装 [Go](https://golang.org) 1.18+ 和 GCC 5.4+。
+在 Windows 系统编译 JuiceFS 客户端需要安装以下依赖：
 
-由于 GCC 没有原生 Windows 客户端，因此需要使用第三方提供的版本，可以使用 [MinGW-w64](https://sourceforge.net/projects/mingw-w64/) 或 [Cygwin](https://www.cygwin.com/)，这里以 MinGW-w64 为例介绍。
+- [WinFsp](https://github.com/winfsp/winfsp)
+- [Go](https://golang.org) 1.18+
+- GCC 5.4+
 
-下载 MinGW-w64 并将其内的 `bin` 目录添加到系统环境变量。
+其中，WinFsp 和 Go 直接下载安装即可。GCC 需要使用第三方提供的版本，可以使用 [MinGW-w64](https://www.mingw-w64.org) 或 [Cygwin](https://www.cygwin.com)，这里以 MinGW-w64 为例介绍。
+
+在 [MinGW-w64 的下载页面](https://www.mingw-w64.org/downloads) 选择一个适用于 Windows 的预编译版本，比如 [mingw-builds-binaries](https://github.com/niXman/mingw-builds-binaries/releases)。下载完成后，将其解压到 `C` 盘根目录，然后在系统环境变量设置中找到 PATH 并添加 `C:\mingw64\bin` 目录，重启系统后在命令行或 PowerShell 中执行 `gcc -v` 命令，如果能看到版本信息则说明 MingGW-w64 安装成功，接下来就可以开始编译了。
 
 1. 克隆并进入项目目录
 
@@ -233,6 +276,8 @@ CMD [ "juicefs" ]
    ```shell
    go build -ldflags="-s -w" -o juicefs.exe .
    ```
+
+编译好的 `juicefs.exe` 二进制程序位于当前目录。为了方便使用，可以将其移动到 `C:\Windows\System32` 目录下，这样就可以在任何地方直接使用 `juicefs.exe` 命令了。
 
 ### 在 Linux 中交叉编译 Windows 客户端
 
@@ -274,7 +319,7 @@ make juicefs.exe
    make juicefs.linux
    ```
 
-## 卸载客户端
+## 卸载客户端 {#uninstall}
 
 JuiceFS 客户端只有一个二进制文件，只需找到程序所在位置删除即可。例如，参照本文档 Linux 系统安装的客户端，执行以下命令卸载客户端：
 

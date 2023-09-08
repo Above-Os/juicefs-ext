@@ -1,10 +1,8 @@
 ---
-sidebar_label: 在腾讯云使用 JuiceFS
-sidebar_position: 5
+title: 在腾讯云使用 JuiceFS
+sidebar_position: 8
 slug: /clouds/qcloud
 ---
-
-# 在腾讯云安装和使用 JuiceFS 存储
 
 如下图所示，JuiceFS 存储由数据库和对象存储共同驱动。存入 JuiceFS 的文件会按照一定的规则被拆分成固定大小的数据块存储在对象存储中，数据对应的元数据则会存储在数据库中。
 
@@ -12,7 +10,7 @@ slug: /clouds/qcloud
 
 这样的设计可以有效缩减对象存储在请求数量上的费用，同时也能让我们显著感受到 JuiceFS 带来的性能提升。
 
-![](../images/juicefs-qcloud.png)
+![JuiceFS-qcloud](../images/juicefs-qcloud.png)
 
 ## 准备
 
@@ -37,7 +35,7 @@ JuiceFS 默认会占用不超过 1GB 的硬盘空间作为缓存，可以根据�
 | **CPU**      | 1 核                     |
 | **内存**     | 2 GB                     |
 | **存储**     | 50 GB                    |
-| **操作系统** | Ubuntu Server 20.04 64位 |
+| **操作系统** | Ubuntu Server 20.04 64 位 |
 | **地域**     | 上海五区                 |
 
 ### 二、云数据库
@@ -46,7 +44,7 @@ JuiceFS 会将数据对应的元数据全部存储在独立的数据库中，目
 
 根据数据库类型的不同，带来的元数据性能和可靠性表现也各不相同。比如 Redis 是完全运行在内存上的，它能提供极致的性能，但运维难度较高，可靠性相对低。而 MySQL、PostgreSQL 是关系型数据库，性能不如 Redis，但运维难度不高，可靠性也有一定的保障。SQLite 是单机单文件关系型数据库，性能较低，也不适合用于大规模数据存储，但它免配置，适合单机少量数据存储的场景。
 
-如果只是为了评估 JuiceFS 的功能，你可以在 CVM 云服务器手动搭建数据库使用。当你要在生产环境使用 JucieFS 时，如果没有专业的数据库运维团队，腾讯云的云数据库服务通常是更好的选择。
+如果只是为了评估 JuiceFS 的功能，你可以在 CVM 云服务器手动搭建数据库使用。当你要在生产环境使用 JuiceFS 时，如果没有专业的数据库运维团队，腾讯云的云数据库服务通常是更好的选择。
 
 当然，如果你愿意，也可以使用其他云平台上提供的云数据库服务。但在这种情况下，你只能通过公网访问云数据库，也就是说，你必须向公网暴露数据库的端口，这存在极大的安全风险，最好不要这样使用。
 
@@ -69,7 +67,7 @@ JuiceFS 会将数据对应的元数据全部存储在独立的数据库中，目
 
 注意，数据库的连接地址取决于你创建的 VPC 网络设置，创建 Redis 实例时会自动在你定义的网段中获取地址。
 
-![](../images/qcloud-redis-network.png)
+![qcloud-Redis-network](../images/qcloud-redis-network.png)
 
 ### 三、对象存储 COS
 
@@ -146,7 +144,7 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             only warning and errors (default: false)
    --trace                 enable trace log (default: false)
-   --no-agent              Disable pprof (:6060) and gops (:6070) agent (default: false)
+   --no-agent              disable pprof (:6060) agent (default: false)
    --help, -h              show help (default: false)
    --version, -V           print only the version (default: false)
 
@@ -160,23 +158,23 @@ JuiceFS 具有良好的跨平台兼容性，同时支持在 Linux、Windows 和 
 
 JuiceFS 客户端安装好以后，现在就可以使用前面准备好的 Redis 数据库和 COS 对象存储来创建 JuiceFS 存储了。
 
-严格意义上说，这一步操作应该叫做 “Format a volume”，即格式化一个卷。但考虑到有很多用户可能不了解或者不关心文件系统的标准术语，所以简单起见，我们就直白的把这个过程叫做“创建 JuiceFS 存储”。
+严格意义上说，这一步操作应该叫做“Format a volume”，即格式化一个卷。但考虑到有很多用户可能不了解或者不关心文件系统的标准术语，所以简单起见，我们就直白的把这个过程叫做“创建 JuiceFS 存储”。
 
 以下命令使用 JuiceFS 客户端提供的 `format` 子命令创建了一个名为 `mystor` 的存储，即文件系统：
 
 ```shell
 $ juicefs format \
-	--storage cos \
-	--bucket https://<your-bucket-name> \
-	--access-key <your-access-key-id> \
-	--secret-key <your-access-key-secret> \
-	redis://:<your-redis-password>@192.168.5.5:6379/1 \
-	mystor
+    --storage cos \
+    --bucket https://<your-bucket-name> \
+    --access-key <your-access-key-id> \
+    --secret-key <your-access-key-secret> \
+    redis://:<your-redis-password>@192.168.5.5:6379/1 \
+    mystor
 ```
 
 **选项说明：**
 
-- `--storage`：指定对象存储类型，[点此查看](../guide/how_to_set_up_object_storage.md#%E6%94%AF%E6%8C%81%E7%9A%84%E5%AD%98%E5%82%A8%E6%9C%8D%E5%8A%A1) JuiceFS 支持的对象存储。
+- `--storage`：指定对象存储类型，[点此查看](../reference/how_to_set_up_object_storage.md#supported-object-storage) JuiceFS 支持的对象存储。
 - `--bucket`：对象存储的 Bucket 访问域名，可以在 COS 的管理控制台找到。
   ![cos-bucket-url](../images/cos-bucket-url.png)
 - `--access-key` 和 `--secret-key`：访问对象存储 API 的秘钥对，[点此查看](https://cloud.tencent.com/document/product/598/37140)获取方式。
@@ -285,22 +283,4 @@ sudo juicefs umount /mnt/jfs
 
 ## 开机自动挂载
 
-如果你不想每次重启系统都要重新手动挂载 JuiceFS 存储，可以设置自动挂载文件系统。
-
-首先，需要将  `juicefs` 客户端重命名为 `mount.juicefs` 并复制到 `/sbin/` 目录：
-
-```shell
-sudo cp juice/juicefs /sbin/mount.juicefs
-```
-
-编辑 `/etc/fstab` 配置文件，新增一条记录：
-
-```shell
-redis://:<your-redis-password>@192.168.5.5:6379/1    /mnt/jfs       juicefs     _netdev,cache-size=20480     0  0
-```
-
-挂载选项中 `cache-size=20480` 代表分配 20GB 本地磁盘空间作为 JuiceFS 的缓存使用，请根据你实际的 CVM 硬盘容量去决定分配的缓存大小。一般来说，为 JuiceFS 分配更大的缓存空间，可以获得更好的性能表现。
-
-你可以根据需要调整上述配置中的 FUSE 挂载选项，更多内容请[查阅文档](../reference/fuse_mount_options.md)。
-
-> **注意**：请将上述配置文件中的 Redis 地址、挂载点以及挂载选项，替换成你实际的信息。
+请参考[「启动时自动挂载 JuiceFS」](../administration/mount_at_boot.md)

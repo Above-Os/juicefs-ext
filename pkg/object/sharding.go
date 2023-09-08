@@ -35,6 +35,12 @@ func (s *sharded) String() string {
 	return fmt.Sprintf("shard%d://%s", len(s.stores), s.stores[0])
 }
 
+func (s *sharded) Limits() Limits {
+	l := s.stores[0].Limits()
+	l.IsSupportUploadPartCopy = false
+	return l
+}
+
 func (s *sharded) Create() error {
 	for _, o := range s.stores {
 		if err := o.Create(); err != nil {
@@ -63,15 +69,27 @@ func (s *sharded) Put(key string, body io.Reader) error {
 	return s.pick(key).Put(key, body)
 }
 
+func (s *sharded) Copy(dst, src string) error {
+	return notSupported
+}
+
 func (s *sharded) Delete(key string) error {
 	return s.pick(key).Delete(key)
+}
+
+func (s *sharded) SetStorageClass(sc string) {
+	for _, o := range s.stores {
+		if os, ok := o.(SupportStorageClass); ok {
+			os.SetStorageClass(sc)
+		}
+	}
 }
 
 const maxResults = 10000
 
 // ListAll on all the keys that starts at marker from object storage.
-func ListAll(store ObjectStorage, prefix, marker string) (<-chan Object, error) {
-	if ch, err := store.ListAll(prefix, marker); err == nil {
+func ListAll(store ObjectStorage, prefix, marker string, followLink bool) (<-chan Object, error) {
+	if ch, err := store.ListAll(prefix, marker, followLink); err == nil {
 		return ch, nil
 	} else if !errors.Is(err, notSupported) {
 		return nil, err
@@ -80,13 +98,17 @@ func ListAll(store ObjectStorage, prefix, marker string) (<-chan Object, error) 
 	startTime := time.Now()
 	out := make(chan Object, maxResults)
 	logger.Debugf("Listing objects from %s marker %q", store, marker)
-	objs, err := store.List(prefix, marker, maxResults)
+	objs, err := store.List(prefix, marker, "", maxResults, followLink)
+	if err == notSupported {
+		return ListAllWithDelimiter(store, prefix, marker, "", followLink)
+	}
 	if err != nil {
 		logger.Errorf("Can't list %s: %s", store, err.Error())
 		return nil, err
 	}
 	logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
 	go func() {
+		defer close(out)
 		lastkey := ""
 		first := true
 	END:
@@ -112,16 +134,15 @@ func ListAll(store ObjectStorage, prefix, marker string) (<-chan Object, error) 
 			marker = lastkey
 			startTime = time.Now()
 			logger.Debugf("Continue listing objects from %s marker %q", store, marker)
-			objs, err = store.List(prefix, marker, maxResults)
+			objs, err = store.List(prefix, marker, "", maxResults, followLink)
 			for err != nil {
 				logger.Warnf("Fail to list: %s, retry again", err.Error())
 				// slow down
 				time.Sleep(time.Millisecond * 100)
-				objs, err = store.List(prefix, marker, maxResults)
+				objs, err = store.List(prefix, marker, "", maxResults, followLink)
 			}
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
 		}
-		close(out)
 	}()
 	return out, nil
 }
@@ -145,10 +166,10 @@ func (s *nextObjects) Pop() interface{} {
 	return o
 }
 
-func (s *sharded) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s *sharded) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	heads := &nextObjects{make([]nextKey, 0)}
 	for i := range s.stores {
-		ch, err := ListAll(s.stores[i], prefix, marker)
+		ch, err := ListAll(s.stores[i], prefix, marker, followLink)
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %s", s.stores[i], err)
 		}

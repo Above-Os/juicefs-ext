@@ -16,33 +16,32 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**.md'
+      - '.github/**'
   workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
 
 jobs:
   sdktest:
-    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    runs-on: ubuntu-20.04
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.18.x'
-
-      - name: Set up Docker
-        uses: docker-practice/actions-setup-docker@master
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
 
-      - name: Build linux target
-        run: |
-          make juicefs
+      - name: Build
+        uses: ./.github/actions/build
 
       - name: Set up Java
         uses: actions/setup-java@v3
         with:
-          distribution: 'adopt'
+          distribution: 'temurin'
           java-version: '8'
 
       - name: Run Redis
@@ -61,6 +60,9 @@ jobs:
           echo "hello juicefs" > /jfs/inner_sym_target
           cd /jfs
           ln -s inner_sym_target inner_sym_link 
+          mkdir etc
+          chmod 777 etc
+          echo `hostname` > etc/nodes
 
       - name: Sdk Test
         run: |
@@ -77,5 +79,6 @@ jobs:
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
 
       - name: Setup upterm session
-        if: ${{ failure() }}
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' }}
+        timeout-minutes: 60
         uses: lhotari/action-upterm@v1

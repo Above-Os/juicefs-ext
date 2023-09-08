@@ -24,8 +24,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 
 	"golang.org/x/sys/unix"
 )
@@ -42,7 +44,7 @@ type Statfs struct {
 
 func (v *VFS) StatFS(ctx Context, ino Ino) (st *Statfs, err syscall.Errno) {
 	var totalspace, availspace, iused, iavail uint64
-	_ = v.Meta.StatFS(ctx, &totalspace, &availspace, &iused, &iavail)
+	_ = v.Meta.StatFS(ctx, ino, &totalspace, &availspace, &iused, &iavail)
 	st = new(Statfs)
 	st.Total = totalspace
 	st.Avail = availspace
@@ -139,10 +141,10 @@ func setattrStr(set int, mode, uid, gid uint32, atime, mtime int64, size uint64)
 	return r
 }
 
-func (v *VFS) SetAttr(ctx Context, ino Ino, set int, opened uint8, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (entry *meta.Entry, err syscall.Errno) {
+func (v *VFS) SetAttr(ctx Context, ino Ino, set int, fh uint64, mode, uid, gid uint32, atime, mtime int64, atimensec, mtimensec uint32, size uint64) (entry *meta.Entry, err syscall.Errno) {
 	str := setattrStr(set, mode, uid, gid, atime, mtime, size)
 	defer func() {
-		logit(ctx, "setattr (%d,0x%X,[%s]): %s%s", ino, set, str, strerr(err), (*Entry)(entry))
+		logit(ctx, "setattr (%d[%d],0x%X,[%s]): %s%s", ino, fh, set, str, strerr(err), (*Entry)(entry))
 	}()
 	if IsSpecialNode(ino) {
 		n := getInternalNode(ino)
@@ -156,7 +158,7 @@ func (v *VFS) SetAttr(ctx Context, ino Ino, set int, opened uint8, mode, uid, gi
 	err = syscall.EINVAL
 	var attr = &Attr{}
 	if set&meta.SetAttrSize != 0 {
-		err = v.Truncate(ctx, ino, int64(size), opened, attr)
+		err = v.Truncate(ctx, ino, int64(size), fh, attr)
 		if err != 0 {
 			return
 		}
@@ -178,6 +180,20 @@ func (v *VFS) SetAttr(ctx Context, ino Ino, set int, opened uint8, mode, uid, gi
 		attr.Mtime = mtime
 		attr.Mtimensec = mtimensec
 	}
+	if set&meta.SetAttrMtime != 0 || set&meta.SetAttrMtimeNow != 0 {
+		if ctx.CheckPermission() {
+			if err = v.Meta.CheckSetAttr(ctx, ino, uint16(set), *attr); err != 0 {
+				return
+			}
+		}
+		if set&meta.SetAttrMtime != 0 {
+			v.writer.UpdateMtime(ino, time.Unix(mtime, int64(mtimensec)))
+		}
+		if set&meta.SetAttrMtimeNow != 0 {
+			v.writer.UpdateMtime(ino, time.Now())
+		}
+	}
+
 	err = v.Meta.SetAttr(ctx, ino, uint16(set), 0, attr)
 	if err == 0 {
 		v.UpdateLength(ino, attr)
@@ -203,7 +219,7 @@ func (l lockType) String() string {
 
 func (v *VFS) Getlk(ctx Context, ino Ino, fh uint64, owner uint64, start, len *uint64, typ *uint32, pid *uint32) (err syscall.Errno) {
 	defer func() {
-		logit(ctx, "getlk (%d,%016X): %s (%d,%d,%s,%d)", ino, owner, strerr(err), *start, *len, lockType(*typ), *pid)
+		logit(ctx, "getlk (%d,%d,%016X): %s (%d,%d,%s,%d)", ino, fh, owner, strerr(err), *start, *len, lockType(*typ), *pid)
 	}()
 	if lockType(*typ).String() == "X" {
 		return syscall.EINVAL
@@ -222,7 +238,7 @@ func (v *VFS) Getlk(ctx Context, ino Ino, fh uint64, owner uint64, start, len *u
 
 func (v *VFS) Setlk(ctx Context, ino Ino, fh uint64, owner uint64, start, end uint64, typ uint32, pid uint32, block bool) (err syscall.Errno) {
 	defer func() {
-		logit(ctx, "setlk (%d,%016X,%d,%d,%s,%t,%d): %s", ino, owner, start, end, lockType(typ), block, pid, strerr(err))
+		logit(ctx, "setlk (%d,%d,%016X,%d,%d,%s,%t,%d): %s", ino, fh, owner, start, end, lockType(typ), block, pid, strerr(err))
 	}()
 	if lockType(typ).String() == "X" {
 		return syscall.EINVAL
@@ -252,8 +268,7 @@ func (v *VFS) Setlk(ctx Context, ino Ino, fh uint64, owner uint64, start, end ui
 
 func (v *VFS) Flock(ctx Context, ino Ino, fh uint64, owner uint64, typ uint32, block bool) (err syscall.Errno) {
 	var name string
-	var reqid uint32
-	defer func() { logit(ctx, "flock (%d,%d,%016X,%s,%t): %s", reqid, ino, owner, name, block, strerr(err)) }()
+	defer func() { logit(ctx, "flock (%d,%d,%016X,%s,%t): %s", ino, fh, owner, name, block, strerr(err)) }()
 	switch typ {
 	case syscall.F_RDLCK:
 		name = "LOCKSH"
@@ -289,4 +304,89 @@ func (v *VFS) Flock(ctx Context, ino Ino, fh uint64, owner uint64, typ uint32, b
 		h.Unlock()
 	}
 	return
+}
+
+func (v *VFS) Ioctl(ctx Context, ino Ino, cmd uint32, arg uint64, bufIn, bufOut []byte) (err syscall.Errno) {
+	const (
+		FS_IOC_GETFLAGS    = 0x80086601
+		FS_IOC_SETFLAGS    = 0x40086602
+		FS_IOC_GETFLAGS_32 = 0x80046601
+		FS_IOC_SETFLAGS_32 = 0x40046602
+		FS_IOC_FSGETXATTR  = 0x801C581F
+	)
+	const (
+		FS_IMMUTABLE_FL    = 0x00000010
+		FS_APPEND_FL       = 0x00000020
+		FS_XFLAG_IMMUTABLE = 0x00000008
+		FS_XFLAG_APPEND    = 0x00000010
+	)
+	defer func() { logit(ctx, "ioctl (%d,0x%X,0x%X,%v,%v): %s", ino, cmd, arg, bufIn, bufOut, strerr(err)) }()
+	switch cmd {
+	default:
+		return syscall.ENOTTY
+	case FS_IOC_SETFLAGS, FS_IOC_GETFLAGS, FS_IOC_SETFLAGS_32, FS_IOC_GETFLAGS_32, FS_IOC_FSGETXATTR:
+	}
+	if IsSpecialNode(ino) {
+		return syscall.EPERM
+	}
+	var attr = &Attr{}
+	if cmd>>30 == 1 { // set
+		var iflag uint64
+		if len(bufIn) == 8 {
+			iflag = utils.NativeEndian.Uint64(bufIn)
+		} else if len(bufIn) == 4 {
+			iflag = uint64(utils.NativeEndian.Uint32(bufIn))
+		} else {
+			return syscall.EINVAL
+		}
+		if ctx.CheckPermission() && ctx.Uid() != 0 && iflag&(FS_IMMUTABLE_FL|FS_APPEND_FL) != 0 {
+			return syscall.EPERM
+		}
+		if (iflag & FS_IMMUTABLE_FL) != 0 {
+			attr.Flags |= meta.FlagImmutable
+		}
+		if (iflag & FS_APPEND_FL) != 0 {
+			attr.Flags |= meta.FlagAppend
+		}
+		if iflag &= ^uint64(FS_IMMUTABLE_FL | FS_APPEND_FL); iflag != 0 {
+			return syscall.ENOTSUP
+		}
+		return v.Meta.SetAttr(ctx, ino, meta.SetAttrFlag, 0, attr)
+	} else {
+		if err = v.Meta.GetAttr(ctx, ino, attr); err != 0 {
+			return
+		}
+		var iflag uint64
+		if cmd>>8&0xFF == 'f' { // FS_IOC_GETFLAGS
+			if (attr.Flags & meta.FlagImmutable) != 0 {
+				iflag |= FS_IMMUTABLE_FL
+			}
+			if (attr.Flags & meta.FlagAppend) != 0 {
+				iflag |= FS_APPEND_FL
+			}
+			if len(bufOut) == 8 {
+				utils.NativeEndian.PutUint64(bufOut, iflag)
+			} else if len(bufOut) == 4 {
+				utils.NativeEndian.PutUint32(bufOut, uint32(iflag))
+			} else {
+				return syscall.EINVAL
+			}
+		} else { // 'X', FS_IOC_FSGETXATTR
+			if (attr.Flags & meta.FlagImmutable) != 0 {
+				iflag |= FS_XFLAG_IMMUTABLE
+			}
+			if (attr.Flags & meta.FlagAppend) != 0 {
+				iflag |= FS_XFLAG_APPEND
+			}
+			if len(bufOut) == 28 {
+				utils.NativeEndian.PutUint32(bufOut[:4], uint32(iflag))
+				for i := range bufOut[4:] {
+					bufOut[4+i] = 0
+				}
+			} else {
+				return syscall.EINVAL
+			}
+		}
+		return
+	}
 }

@@ -38,19 +38,26 @@ func (s *oos) String() string {
 	return fmt.Sprintf("oos://%s/", s.s3client.bucket)
 }
 
+func (s *oos) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  false,
+	}
+}
+
 func (s *oos) Create() error {
-	_, err := s.List("", "", 1)
+	_, err := s.List("", "", "", 1, true)
 	if err != nil {
 		return fmt.Errorf("please create bucket %s manually", s.s3client.bucket)
 	}
 	return err
 }
 
-func (s *oos) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *oos) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
-	objs, err := s.s3client.List(prefix, marker, limit)
+	objs, err := s.s3client.List(prefix, marker, delimiter, limit, followLink)
 	if marker != "" && len(objs) > 0 && objs[0].Key() == marker {
 		objs = objs[1:]
 	}
@@ -86,7 +93,7 @@ func newOOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		return nil, fmt.Errorf("OOS session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &oos{s3client{bucket, s3.New(ses), ses}}, nil
+	return &oos{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
 }
 
 func init() {

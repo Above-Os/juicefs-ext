@@ -1,16 +1,14 @@
 ---
-sidebar_label: 配置 JuiceFS S3 网关
-sidebar_position: 5
+title: 配置 JuiceFS S3 网关
+sidebar_position: 4
 slug: /s3_gateway
 ---
-
-# 启用 JuiceFS 的 S3 网关
 
 JuiceFS 从 v0.11 开始引入了 S3 网关，这是一个通过 [MinIO S3 网关](https://docs.min.io/docs/minio-gateway-for-s3.html)实现的功能。它为 JuiceFS 中的文件提供跟 S3 兼容的 RESTful API，在不方便挂载的情况下能够用 s3cmd、AWS CLI、MinIO Client（mc）等工具管理 JuiceFS 上存储的文件。另外，S3 网关还提供了一个基于网页的文件管理器，用户使用浏览器就能对 JuiceFS 上的文件进行常规的增删管理。
 
 因为 JuiceFS 会将文件分块存储到底层的对象存储中，不能直接使用底层对象存储的接口和界面来直接访问文件，S3 网关提供了类似底层对象存储的访问能力，架构图如下：
 
-![](../images/juicefs-s3-gateway-arch.png)
+![JuiceFS-S3-gateway-arch](../images/juicefs-s3-gateway-arch.png)
 
 ## 先决条件
 
@@ -33,7 +31,7 @@ juicefs gateway redis://localhost:6379 localhost:9000
 
 以上三条命令中，前两条命令用于设置环境变量。注意，`MINIO_ROOT_USER` 的长度至少 3 个字符， `MINIO_ROOT_PASSWORD` 的长度至少 8 个字符（Windows 用户请改用 `set` 命令设置环境变量，例如：`set MINIO_ROOT_USER=admin`）。
 
-最后一条命令用于启用 S3 网关，`gateway` 子命令至少需要提供两个参数，第一个是存储元数据的数据库 URL，第二个是 S3 网关监听的地址和端口。你可以根据需要在 `gateway` 子命令中添加[其他选项](../reference/command_reference.md#juicefs-gateway)优化 S3 网关，比如，可以将默认的本地缓存设置为 20 GiB。
+最后一条命令用于启用 S3 网关，`gateway` 子命令至少需要提供两个参数，第一个是存储元数据的数据库 URL，第二个是 S3 网关监听的地址和端口。你可以根据需要在 `gateway` 子命令中添加[其他选项](../reference/command_reference.md#gateway)优化 S3 网关，比如，可以将默认的本地缓存设置为 20 GiB。
 
 ```shell
 juicefs gateway --cache-size 20480 redis://localhost:6379 localhost:9000
@@ -41,7 +39,7 @@ juicefs gateway --cache-size 20480 redis://localhost:6379 localhost:9000
 
 在这个例子中，我们假设 JuiceFS 文件系统使用的是本地的 Redis 数据库。当 S3 网关启用时，在**当前主机**上可以使用 `http://localhost:9000` 这个地址访问到 S3 网关的管理界面。
 
-![](../images/s3-gateway-file-manager.jpg)
+![S3-gateway-file-manager](../images/s3-gateway-file-manager.jpg)
 
 如果你希望通过局域网或互联网上的其他主机访问 S3 网关，则需要调整监听地址，例如：
 
@@ -54,6 +52,46 @@ juicefs gateway redis://localhost:6379 0.0.0.0:9000
 - S3 网关所在主机中的第三方客户端可以使用 `http://127.0.0.1:9000` 或 `http://localhost:9000` 进行访问；
 - 与 S3 网关所在主机处于同一局域网的第三方客户端可以使用 `http://192.168.1.8:9000` 访问（假设启用 S3 网关的主机内网 IP 地址为 192.168.1.8）；
 - 通过互联网访问 S3 网关可以使用 `http://110.220.110.220:9000` 访问（假设启用 S3 网关的主机公网 IP 地址为 110.220.110.220）。
+
+## S3 网关 以守护进程的形式运行
+
+S3 网关 可以通过以下配置以 Linux 守护进程的形式在后台运行。
+
+```shell
+cat > /lib/systemd/system/juicefs-gateway.service<<EOF
+[Unit]
+Description=Juicefs S3 Gateway
+Requires=network.target
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Environment="MINIO_ROOT_USER=admin"
+Environment="MINIO_ROOT_PASSWORD=12345678"
+ExecStart=/usr/local/bin/juicefs gateway redis://localhost:6379 localhost:9000
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+设置进程开机自启动
+
+```shell
+sudo systemctl daemon-reload
+sudo systemctl enable juicefs-gateway --now
+sudo systemctl status juicefs-gateway
+```
+
+检阅进程的日志
+
+```bash
+sudo journalctl -xefu juicefs-gateway.service
+```
 
 ## 访问 S3 网关
 
@@ -112,7 +150,7 @@ $ mc ls juicefs/jfs
 [2021-10-20 11:59:10 CST]  11MiB work-4997565.svg
 ```
 
-## 在 Kubernetes 中部署 S3 网关
+## 在 Kubernetes 中部署 S3 网关 {#deploy-in-kubernetes}
 
 ### 通过 kubectl 部署
 
@@ -135,11 +173,11 @@ kubectl -n ${NAMESPACE} create secret generic juicefs-secret \
 其中：
 
 - `name`：JuiceFS 文件系统名称
-- `metaurl`：元数据服务的访问 URL（比如 Redis）。更多信息参考[这篇文档](../guide/how_to_set_up_metadata_engine.md)。
-- `storage`：对象存储类型，比如 `s3`、`gs`、`oss`。更多信息参考[这篇文档](../guide/how_to_set_up_object_storage.md)。
-- `bucket`：Bucket URL。更多信息参考[这篇文档](../guide/how_to_set_up_object_storage.md)。
-- `access-key`：对象存储的 access key。更多信息参考[这篇文档](../guide/how_to_set_up_object_storage.md)。
-- `secret-key`：对象存储的 secret key。更多信息参考[这篇文档](../guide/how_to_set_up_object_storage.md)。
+- `metaurl`：元数据服务的访问 URL（比如 Redis）。更多信息参考[这篇文档](../reference/how_to_set_up_metadata_engine.md)。
+- `storage`：对象存储类型，比如 `s3`、`gs`、`oss`。更多信息参考[这篇文档](../reference/how_to_set_up_object_storage.md)。
+- `bucket`：Bucket URL。更多信息参考[这篇文档](../reference/how_to_set_up_object_storage.md)。
+- `access-key`：对象存储的 access key。更多信息参考[这篇文档](../reference/how_to_set_up_object_storage.md)。
+- `secret-key`：对象存储的 secret key。更多信息参考[这篇文档](../reference/how_to_set_up_object_storage.md)。
 
 然后下载 S3 网关[部署 YAML](https://github.com/juicedata/juicefs/blob/main/deploy/juicefs-s3-gateway.yaml) 并通过 `kubectl` 创建 `Deployment` 和 `Service` 资源。以下几点需要特别注意：
 
@@ -148,7 +186,7 @@ kubectl -n ${NAMESPACE} create secret generic juicefs-secret \
 - 默认使用 `juicedata/juicefs-csi-driver` 最新版镜像，其中已经集成了最新版 JuiceFS 客户端，具体集成的 JuiceFS 客户端版本请查看[这里](https://github.com/juicedata/juicefs-csi-driver/releases)。
 - `Deployment` 的 `initContainers` 会先尝试格式化 JuiceFS 文件系统，如果你已经提前格式化完毕，这一步不会影响现有 JuiceFS 文件系统。
 - S3 网关默认监听的端口号为 9000
-- S3 网关[启动选项](../reference/command_reference.md#juicefs-gateway)均为默认值，请根据实际需求调整。
+- S3 网关[启动选项](../reference/command_reference.md#gateway)均为默认值，请根据实际需求调整。
 - `MINIO_ROOT_USER` 环境变量的值为 Secret 中的 `access-key`，`MINIO_ROOT_PASSWORD` 环境变量的值为 Secret 中的 `secret-key`。
 
 ```shell
@@ -170,7 +208,7 @@ juicefs-s3-gateway   ClusterIP   10.101.108.42   <none>        9000/TCP   142m
 
 可以在应用 pod 中通过 `juicefs-s3-gateway.${NAMESPACE}.svc.cluster.local:9000` 域名或 `juicefs-s3-gateway` 的 pod IP 及端口号（例如 `10.244.2.238:9000`）访问 JuiceFS S3 网关。
 
-若想通过 Ingress 访问，需要确保集群中已经部署了 Ingress Controller，参考 [Ingress Controller 部署文档](https://kubernetes.github.io/ingress-nginx/deploy/)。创建 `Ingress` 资源：
+若想通过 Ingress 访问，需要确保集群中已经部署了 Ingress Controller，参考 [Ingress Controller 部署文档](https://kubernetes.github.io/ingress-nginx/deploy)。创建 `Ingress` 资源：
 
 ```yaml
 kubectl apply -f - <<EOF
@@ -200,7 +238,7 @@ EOF
 kubectl get services -n ingress-nginx
 ```
 
-Ingress 的各个版本之间差异较大，更多使用方式请参考 [Ingress Controller 使用文档](https://kubernetes.github.io/ingress-nginx/user-guide/basic-usage/)。
+Ingress 的各个版本之间差异较大，更多使用方式请参考 [Ingress Controller 使用文档](https://kubernetes.github.io/ingress-nginx/user-guide/basic-usage)。
 
 ### 通过 Helm 部署
 
@@ -222,7 +260,7 @@ Ingress 的各个版本之间差异较大，更多使用方式请参考 [Ingress
 
    ```yaml title="values.yaml"
    ingress:
-     enables: true
+     enabled: true
    ```
 
 2. 部署
@@ -266,13 +304,15 @@ Ingress 的各个版本之间差异较大，更多使用方式请参考 [Ingress
 :::tip 提示
 该分支依赖较新版本的 JuiceFS，具体的 JuiceFS 版本请查看 [`go.mod`](https://github.com/juicedata/minio/blob/gateway/go.mod) 文件。
 
-与[手动编译 JuiceFS 客户端](../getting-started/installation.md#手动编译客户端)类似，你需要提前安装一些依赖才能正常编译 S3 网关。
+与[手动编译 JuiceFS 客户端](../getting-started/installation.md#install-the-pre-compiled-client)类似，你需要提前安装一些依赖才能正常编译 S3 网关。
 :::
 
 ```shell
 git clone -b gateway git@github.com:juicedata/minio.git && cd minio
 ```
-将会生成 minio 二进制文件
+
+将会生成 MinIO 二进制文件
+
 ```shell
 make build
 ```
@@ -294,4 +334,4 @@ export MINIO_ROOT_PASSWORD=12345678
 
 这里显式指定了 S3 网关控制台的端口号为 59001，如果不指定则会随机选择一个端口。根据命令行提示，在浏览器中打开 [http://127.0.0.1:59001](http://127.0.0.1:59001) 地址便可以访问控制台，如下图所示：
 
-![](../images/s3-gateway-console.png)
+![S3-gateway-console](../images/s3-gateway-console.png)

@@ -20,9 +20,8 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -32,13 +31,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oliverisaac/shellescape"
+
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 // Stat has the counters to represent the progress.
 type Stat struct {
 	Copied       int64 // the number of copied files
 	CopiedBytes  int64 // total amount of copied data in bytes
+	Checked      int64 // the number of checked files
 	CheckedBytes int64 // total amount of checked data in bytes
 	Deleted      int64 // the number of deleted files
 	Skipped      int64 // the number of files skipped
@@ -48,10 +51,17 @@ type Stat struct {
 func updateStats(r *Stat) {
 	copied.IncrInt64(r.Copied)
 	copiedBytes.IncrInt64(r.CopiedBytes)
-	checkedBytes.IncrInt64(r.CheckedBytes)
-	deleted.IncrInt64(r.Deleted)
+	if checked != nil {
+		checked.IncrInt64(r.Checked)
+		checkedBytes.IncrInt64(r.CheckedBytes)
+	}
+	if deleted != nil {
+		deleted.IncrInt64(r.Deleted)
+	}
 	skipped.IncrInt64(r.Skipped)
-	failed.IncrInt64(r.Failed)
+	if failed != nil {
+		failed.IncrInt64(r.Failed)
+	}
 	handled.IncrInt64(r.Copied + r.Deleted + r.Skipped + r.Failed)
 }
 
@@ -70,69 +80,46 @@ func httpRequest(url string, body []byte) (ans []byte, err error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
 func sendStats(addr string) {
 	var r Stat
+	r.Skipped = skipped.Current()
 	r.Copied = copied.Current()
 	r.CopiedBytes = copiedBytes.Current()
-	r.CheckedBytes = checkedBytes.Current()
-	r.Deleted = deleted.Current()
-	r.Skipped = skipped.Current()
-	r.Failed = failed.Current()
+	if checked != nil {
+		r.Checked = checked.Current()
+		r.CheckedBytes = checkedBytes.Current()
+	}
+	if deleted != nil {
+		r.Deleted = deleted.Current()
+	}
+	if failed != nil {
+		r.Failed = failed.Current()
+	}
 	d, _ := json.Marshal(r)
 	ans, err := httpRequest(fmt.Sprintf("http://%s/stats", addr), d)
 	if err != nil || string(ans) != "OK" {
 		logger.Errorf("update stats: %s %s", string(ans), err)
 	} else {
+		skipped.IncrInt64(-r.Skipped)
 		copied.IncrInt64(-r.Copied)
 		copiedBytes.IncrInt64(-r.CopiedBytes)
-		checkedBytes.IncrInt64(-r.CheckedBytes)
-		deleted.IncrInt64(-r.Deleted)
-		skipped.IncrInt64(-r.Skipped)
-		failed.IncrInt64(-r.Failed)
+		if checked != nil {
+			checked.IncrInt64(-r.Checked)
+			checkedBytes.IncrInt64(-r.CheckedBytes)
+		}
+		if deleted != nil {
+			deleted.IncrInt64(-r.Deleted)
+		}
+		if failed != nil {
+			failed.IncrInt64(-r.Failed)
+		}
 	}
 }
 
-func findLocalIP() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue // interface down
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue // loopback interface
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			return "", err
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-			ip = ip.To4()
-			if ip == nil {
-				continue // not an ipv4 address
-			}
-			return ip.String(), nil
-		}
-	}
-	return "", errors.New("are you connected to the network?")
-}
-
-func startManager(tasks <-chan object.Object) (string, error) {
+func startManager(config *Config, tasks <-chan object.Object) (string, error) {
 	http.HandleFunc("/fetch", func(w http.ResponseWriter, req *http.Request) {
 		var objs []object.Object
 		obj, ok := <-tasks
@@ -169,7 +156,7 @@ func startManager(tasks <-chan object.Object) (string, error) {
 			http.Error(w, "POST required", http.StatusBadRequest)
 			return
 		}
-		d, err := ioutil.ReadAll(req.Body)
+		d, err := io.ReadAll(req.Body)
 		if err != nil {
 			logger.Errorf("read: %s", err)
 			return
@@ -184,19 +171,37 @@ func startManager(tasks <-chan object.Object) (string, error) {
 		logger.Debugf("receive stats %+v from %s", r, req.RemoteAddr)
 		_, _ = w.Write([]byte("OK"))
 	})
-	ip, err := findLocalIP()
-	if err != nil {
-		return "", fmt.Errorf("find local ip: %s", err)
+	var addr string
+	if config.ManagerAddr != "" {
+		addr = config.ManagerAddr
+	} else {
+		ips, err := utils.FindLocalIPs()
+		if err != nil {
+			return "", fmt.Errorf("find local ips: %s", err)
+		}
+		var ip string
+		for _, i := range ips {
+			if i = i.To4(); i != nil {
+				ip = i.String()
+				break
+			}
+		}
+		if ip == "" {
+			return "", fmt.Errorf("no local ip found")
+		}
 	}
-	l, err := net.Listen("tcp", ip+":")
+
+	if !strings.Contains(addr, ":") {
+		addr += ":"
+	}
+
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", fmt.Errorf("listen: %s", err)
 	}
 	logger.Infof("Listen at %s", l.Addr())
 	go func() { _ = http.Serve(l, nil) }()
-	ps := strings.Split(l.Addr().String(), ":")
-	port := ps[len(ps)-1]
-	return fmt.Sprintf("%s:%s", ip, port), nil
+	return l.Addr().String(), nil
 }
 
 func findSelfPath() (string, error) {
@@ -244,7 +249,22 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 				return
 			}
 			// launch itself
-			var args = []string{host, rpath}
+			var args = []string{host}
+			// set env
+			var printEnv []string
+			for k, v := range config.Env {
+				args = append(args, fmt.Sprintf("%s=%s", k, v))
+				if strings.Contains(k, "SECRET") ||
+					strings.Contains(k, "TOKEN") ||
+					strings.Contains(k, "PASSWORD") ||
+					strings.Contains(k, "AZURE_STORAGE_CONNECTION_STRING") ||
+					strings.Contains(k, "JFS_RSA_PASSPHRASE") {
+					v = "******"
+				}
+				printEnv = append(printEnv, fmt.Sprintf("%s=%s", k, v))
+			}
+
+			args = append(args, rpath)
 			if strings.HasSuffix(path, "juicefs") {
 				args = append(args, os.Args[1:]...)
 				args = append(args, "--manager", address)
@@ -255,9 +275,13 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 			if !config.Verbose && !config.Quiet {
 				args = append(args, "-q")
 			}
-
-			logger.Debugf("launch worker command args: [ssh, %s]", strings.Join(args, ", "))
-			cmd = exec.Command("ssh", args...)
+			var argsBk = make([]string, len(args))
+			copy(argsBk, args)
+			for i, s := range printEnv {
+				argsBk[i+1] = s
+			}
+			logger.Debugf("launch worker command args: [ssh, %s]", strings.Join(shellescape.EscapeArgs(argsBk), ", "))
+			cmd = exec.Command("ssh", shellescape.EscapeArgs(args)...)
 			stderr, err := cmd.StderrPipe()
 			if err != nil {
 				logger.Errorf("redirect stderr: %s", err)

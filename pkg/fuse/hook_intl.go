@@ -46,7 +46,7 @@ func (o *fuseHook) sendEvent(i Ino, op Op) {
 }
 
 func (o *fuseHook) matchPathNames(i Ino, s string) [][]string {
-	paths := meta.GetPaths(o.v.Meta, o.ctx, i)
+	paths := o.v.Meta.GetPaths(o.ctx, i)
 
 	matchPath := func(paths []string, sub string) (p, k string) {
 		if sub != "" {

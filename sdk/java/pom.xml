@@ -6,7 +6,7 @@
 	<url>https://github.com/juicedata/juicefs</url>
 	<description>Hadoop FileSystem implementation for JuiceFS</description>
 	<artifactId>juicefs-hadoop</artifactId>
-	<version>1.0.4</version>
+	<version>1.1.0</version>
 	<packaging>jar</packaging>
 	<properties>
 		<hadoop.version>3.1.4</hadoop.version>
@@ -185,6 +185,25 @@
 					</execution>
 				</executions>
 			</plugin>
+			<plugin>
+				<groupId>org.pitest</groupId>
+				<artifactId>pitest-maven</artifactId>
+				<version>1.9.11</version>
+				<configuration>
+					<targetClasses>
+						<param>io.juicefs.JuiceFileSystemImpl*</param>
+					</targetClasses>
+					<targetTests>
+						<param>io.juicefs.JuiceFileSystemTest</param>
+					</targetTests>
+					<timeoutConstant>1000</timeoutConstant>
+					<avoidCallsTo>
+						<avoidCallsTo>org.apache.log4j</avoidCallsTo>
+						<avoidCallsTo>org.slf4j</avoidCallsTo>
+						<avoidCallsTo>org.apache.commons.logging</avoidCallsTo>
+					</avoidCallsTo>
+				</configuration>
+			</plugin>
 		</plugins>
 		<resources>
 			<resource>
@@ -275,7 +294,7 @@
 		<dependency>
 			<groupId>com.google.guava</groupId>
 			<artifactId>guava</artifactId>
-			<version>30.1.1-jre</version>
+			<version>32.0.1-jre</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>

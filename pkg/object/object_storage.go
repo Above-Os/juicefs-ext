@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,10 @@ type SupportSymlink interface {
 	Symlink(oldName, newName string) error
 	// Readlink read a symbolic link
 	Readlink(name string) (string, error)
+}
+
+type SupportStorageClass interface {
+	SetStorageClass(sc string)
 }
 
 type File interface {
@@ -110,8 +115,16 @@ func (s DefaultObjectStorage) Create() error {
 	return nil
 }
 
+func (s DefaultObjectStorage) Limits() Limits {
+	return Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
+}
+
 func (s DefaultObjectStorage) Head(key string) (Object, error) {
 	return nil, notSupported
+}
+
+func (s DefaultObjectStorage) Copy(dst, src string) error {
+	return notSupported
 }
 
 func (s DefaultObjectStorage) CreateMultipartUpload(key string) (*MultipartUpload, error) {
@@ -119,6 +132,10 @@ func (s DefaultObjectStorage) CreateMultipartUpload(key string) (*MultipartUploa
 }
 
 func (s DefaultObjectStorage) UploadPart(key string, uploadID string, num int, body []byte) (*Part, error) {
+	return nil, notSupported
+}
+
+func (s DefaultObjectStorage) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
 	return nil, notSupported
 }
 
@@ -132,11 +149,11 @@ func (s DefaultObjectStorage) ListUploads(marker string) ([]*PendingPart, string
 	return nil, "", nil
 }
 
-func (s DefaultObjectStorage) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s DefaultObjectStorage) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	return nil, notSupported
 }
 
-func (s DefaultObjectStorage) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s DefaultObjectStorage) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -162,4 +179,153 @@ var bufPool = sync.Pool{
 		buf := make([]byte, 32<<10)
 		return &buf
 	},
+}
+
+type listThread struct {
+	sync.Mutex
+	cond    *utils.Cond
+	ready   bool
+	err     error
+	entries []Object
+}
+
+func ListAllWithDelimiter(store ObjectStorage, prefix, start, end string, followLink bool) (<-chan Object, error) {
+	entries, err := store.List(prefix, "", "/", 1e9, followLink)
+	if err != nil {
+		logger.Errorf("list %s: %s", prefix, err)
+		return nil, err
+	}
+
+	listed := make(chan Object, 10240)
+	var walk func(string, []Object) error
+	walk = func(prefix string, entries []Object) error {
+		var concurrent = 10
+		var err error
+		threads := make([]listThread, concurrent)
+		for c := 0; c < concurrent; c++ {
+			t := &threads[c]
+			t.cond = utils.NewCond(t)
+			go func(c int) {
+				for i := c; i < len(entries); i += concurrent {
+					key := entries[i].Key()
+					if end != "" && key >= end {
+						break
+					}
+					if key < start && !strings.HasPrefix(start, key) {
+						continue
+					}
+					if !entries[i].IsDir() || key == prefix {
+						continue
+					}
+
+					t.entries, t.err = store.List(key, "\x00", "/", 1e9, followLink) // exclude itself
+					t.Lock()
+					t.ready = true
+					t.cond.Signal()
+					for t.ready {
+						t.cond.WaitWithTimeout(time.Second)
+						if err != nil {
+							t.Unlock()
+							return
+						}
+					}
+					t.Unlock()
+				}
+			}(c)
+		}
+
+		for i, e := range entries {
+			key := e.Key()
+			if end != "" && key >= end {
+				return nil
+			}
+			if key >= start {
+				listed <- e
+			} else if !strings.HasPrefix(start, key) {
+				continue
+			}
+			if !e.IsDir() || key == prefix {
+				continue
+			}
+
+			t := &threads[i%concurrent]
+			t.Lock()
+			for !t.ready {
+				t.cond.WaitWithTimeout(time.Millisecond * 10)
+			}
+			if t.err != nil {
+				err = t.err
+				t.Unlock()
+				return err
+			}
+			t.ready = false
+			t.cond.Signal()
+			children := t.entries
+			t.Unlock()
+
+			err = walk(key, children)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	go func() {
+		defer close(listed)
+		err := walk(prefix, entries)
+		if err != nil {
+			listed <- nil
+		}
+	}()
+	return listed, nil
+}
+
+func init() {
+	ReqIDCache = reqIDCache{cache: make(map[string]reqItem)}
+	go ReqIDCache.clean()
+}
+
+type reqItem struct {
+	reqID string
+	time  time.Time
+}
+
+var ReqIDCache reqIDCache
+
+type reqIDCache struct {
+	sync.Mutex
+	cache map[string]reqItem
+}
+
+func (*reqIDCache) clean() {
+	for range time.Tick(time.Second) {
+		ReqIDCache.Lock()
+		for k, v := range ReqIDCache.cache {
+			if time.Since(v.time) > time.Second {
+				delete(ReqIDCache.cache, k)
+			}
+		}
+		ReqIDCache.Unlock()
+	}
+}
+
+func (*reqIDCache) put(key, reqID string) {
+	if reqID == "" {
+		return
+	}
+	if part := strings.Split(key, "chunks"); len(part) == 2 {
+		ReqIDCache.Lock()
+		defer ReqIDCache.Unlock()
+		ReqIDCache.cache[part[1]] = reqItem{reqID: reqID, time: time.Now()}
+	}
+}
+
+func (*reqIDCache) Get(key string) string {
+	if part := strings.Split(key, "chunks"); len(part) == 2 {
+		ReqIDCache.Lock()
+		defer ReqIDCache.Unlock()
+		return ReqIDCache.cache[part[1]].reqID
+	}
+	return ""
 }

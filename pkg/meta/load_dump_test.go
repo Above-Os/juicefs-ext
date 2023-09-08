@@ -18,7 +18,8 @@ package meta
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -71,7 +72,7 @@ func TestEscape(t *testing.T) {
 
 func Utf8ToGbk(s []byte) ([]byte, error) {
 	reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewEncoder())
-	d, e := ioutil.ReadAll(reader)
+	d, e := io.ReadAll(reader)
 	if e != nil {
 		return nil, e
 	}
@@ -80,7 +81,7 @@ func Utf8ToGbk(s []byte) ([]byte, error) {
 
 func GbkToUtf8(s []byte) ([]byte, error) {
 	reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewDecoder())
-	d, e := ioutil.ReadAll(reader)
+	d, e := io.ReadAll(reader)
 	if e != nil {
 		return nil, e
 	}
@@ -88,7 +89,7 @@ func GbkToUtf8(s []byte) ([]byte, error) {
 }
 
 func testLoad(t *testing.T, uri, fname string) Meta {
-	m := NewClient(uri, &Config{Retries: 10, Strict: true})
+	m := NewClient(uri, nil)
 	if err := m.Reset(); err != nil {
 		t.Fatalf("reset meta: %s", err)
 	}
@@ -103,11 +104,13 @@ func testLoad(t *testing.T, uri, fname string) Meta {
 
 	ctx := Background
 	var entries []*Entry
-	if st := m.Readdir(ctx, 1, 0, &entries); st != 0 {
+	if st := m.Readdir(ctx, 1, 1, &entries); st != 0 {
 		t.Fatalf("readdir: %s", st)
 	} else if len(entries) != 11 {
 		t.Fatalf("entries: %d", len(entries))
 	}
+
+	var expectedStat dirStat
 	for _, entry := range entries {
 		fname := string(entry.Name)
 		if strings.HasPrefix(fname, "GBK") {
@@ -118,7 +121,50 @@ func testLoad(t *testing.T, uri, fname string) Meta {
 		if strings.HasPrefix(fname, "UTF8") && fname != "UTF8果汁数据科技有限公司目录" && fname != "UTF8果汁数据科技有限公司文件" {
 			t.Fatalf("load entries error: %s", fname)
 		}
+		if string(entry.Name) != "." && string(entry.Name) != ".." {
+			var length uint64
+			if entry.Attr.Typ == TypeFile {
+				length = entry.Attr.Length
+			}
+			expectedStat.inodes++
+			expectedStat.length += int64(length)
+			expectedStat.space += align4K(length)
+		}
 	}
+
+	stat, st := m.(engine).doGetDirStat(ctx, 1, false)
+	if st != 0 {
+		t.Fatalf("get dir stat: %s", st)
+	}
+	if stat == nil {
+		t.Fatalf("get dir stat: nil")
+	}
+	if *stat != expectedStat {
+		t.Fatalf("expected: %v, but got: %v", expectedStat, *stat)
+	}
+
+	var summary Summary
+	if st = m.GetSummary(ctx, 1, &summary, true, true); st != 0 {
+		t.Fatalf("get summary: %s", st)
+	}
+	expectedQuota := Quota{
+		MaxInodes:  100,
+		MaxSpace:   1 << 30,
+		UsedSpace:  int64(summary.Size) - align4K(0),
+		UsedInodes: int64(summary.Dirs+summary.Files) - 1,
+	}
+
+	quota, err := m.(engine).doGetQuota(ctx, 1)
+	if err != nil {
+		t.Fatalf("get quota: %s", err)
+	}
+	if quota == nil {
+		t.Fatalf("get quota: nil")
+	}
+	if *quota != expectedQuota {
+		t.Fatalf("expected: %v, but got: %v", expectedQuota, *quota)
+	}
+
 	attr := &Attr{}
 	if st := m.GetAttr(ctx, 2, attr); st != 0 {
 		t.Fatalf("getattr: %s", st)
@@ -126,6 +172,11 @@ func testLoad(t *testing.T, uri, fname string) Meta {
 	if attr.Nlink != 1 || attr.Length != 24 {
 		t.Fatalf("nlink: %d, length: %d", attr.Nlink, attr.Length)
 	}
+
+	if attr.Flags != 128 {
+		t.Fatalf("expect the flags euqal 128, but actual is: %d", attr.Flags)
+	}
+
 	var slices []Slice
 	if st := m.Read(ctx, 2, 0, &slices); st != 0 {
 		t.Fatalf("read chunk: %s", st)
@@ -161,7 +212,7 @@ func testLoad(t *testing.T, uri, fname string) Meta {
 }
 
 func testLoadSub(t *testing.T, uri, fname string) {
-	m := NewClient(uri, &Config{Retries: 10, Strict: true})
+	m := NewClient(uri, nil)
 	if err := m.Reset(); err != nil {
 		t.Fatalf("reset meta: %s", err)
 	}
@@ -197,7 +248,7 @@ func testDump(t *testing.T, m Meta, root Ino, expect, result string) {
 	if _, err = m.Load(true); err != nil {
 		t.Fatalf("load setting: %s", err)
 	}
-	if err = m.DumpMeta(fp, root); err != nil {
+	if err = m.DumpMeta(fp, root, false); err != nil {
 		t.Fatalf("dump meta: %s", err)
 	}
 	cmd := exec.Command("diff", expect, result)
@@ -211,7 +262,10 @@ func testLoadDump(t *testing.T, name, addr string) {
 		m := testLoad(t, addr, sampleFile)
 		testDump(t, m, 1, sampleFile, "test.dump")
 		m.Shutdown()
-		m = NewClient(addr, &Config{Retries: 10, Strict: true, Subdir: "d1"})
+		conf := DefaultConf()
+		conf.Subdir = "d1"
+		m = NewClient(addr, conf)
+		_ = m.Chroot(Background, "d1")
 		testDump(t, m, 1, subSampleFile, "test_subdir.dump")
 		testDump(t, m, 0, sampleFile, "test.dump")
 		_ = m.Shutdown()
@@ -219,15 +273,21 @@ func testLoadDump(t *testing.T, name, addr string) {
 	})
 }
 
-func TestLoadDump(t *testing.T) {
+func TestLoadDump(t *testing.T) { //skip mutate
 	testLoadDump(t, "redis", "redis://127.0.0.1/10")
+	testLoadDump(t, "mysql", "mysql://root:@/dev")
+	testLoadDump(t, "tikv", "tikv://127.0.0.1:2379/jfs-load-dump")
+}
+
+func TestLoadDumpSlow(t *testing.T) { //skip mutate
+	if os.Getenv("SKIP_NON_CORE") == "true" {
+		t.Skipf("skip non-core test")
+	}
 	testLoadDump(t, "redis cluster", "redis://127.0.0.1:7001/10")
 	testLoadDump(t, "sqlite", "sqlite3://"+path.Join(t.TempDir(), "jfs-load-dump-test.db"))
-	testLoadDump(t, "mysql", "mysql://root:@/dev")
-	testLoadDump(t, "postgres", "postgres://localhost:5432/test?sslmode=disable")
 	testLoadDump(t, "badger", "badger://"+path.Join(t.TempDir(), "jfs-load-duimp-testdb"))
-	testLoadDump(t, "etcd", "etcd://127.0.0.1:2379/jfs-load-dump")
-	testLoadDump(t, "tikv", "tikv://127.0.0.1:2379/jfs-load-dump")
+	testLoadDump(t, "etcd", fmt.Sprintf("etcd://%s/jfs-load-dump", os.Getenv("ETCD_ADDR")))
+	testLoadDump(t, "postgres", "postgres://localhost:5432/test?sslmode=disable")
 }
 
 func TestLoadDump_MemKV(t *testing.T) {
@@ -240,9 +300,8 @@ func TestLoadDump_MemKV(t *testing.T) {
 		_ = os.Remove(settingPath)
 		m := testLoad(t, "memkv://user:pass@test/jfs", sampleFile)
 		if kvm, ok := m.(*kvMeta); ok { // memkv will be empty if created again
-			var err error
-			if kvm.root, err = lookupSubdir(kvm, "d1"); err != nil {
-				t.Fatalf("lookup subdir d1: %s", err)
+			if st := kvm.Chroot(Background, "d1"); st != 0 {
+				t.Fatalf("Chroot to subdir d1: %s", st)
 			}
 		}
 		testDump(t, m, 1, subSampleFile, "test_subdir.dump")

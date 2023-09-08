@@ -45,7 +45,7 @@ type ListBucketResult struct {
 	Marker         string
 	MaxKeys        string
 	NextMarker     string
-	CommonPrefixes string
+	CommonPrefixes []string
 }
 
 func (s *speedy) String() string {
@@ -53,7 +53,10 @@ func (s *speedy) String() string {
 	return fmt.Sprintf("speedy://%s/", uri.Host)
 }
 
-func (s *speedy) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *speedy) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupported
+	}
 	uri, _ := url.ParseRequestURI(s.endpoint)
 
 	query := url.Values{}
@@ -97,7 +100,7 @@ func (s *speedy) List(prefix, marker string, limit int64) ([]Object, error) {
 		if strings.HasSuffix(item.Key, "/.speedycloud_dir_flag") {
 			continue
 		}
-		objs = append(objs, &obj{item.Key, item.Size, item.LastModified, strings.HasSuffix(item.Key, "/")})
+		objs = append(objs, &obj{item.Key, item.Size, item.LastModified, strings.HasSuffix(item.Key, "/"), ""})
 	}
 	return objs, nil
 }

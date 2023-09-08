@@ -21,11 +21,14 @@ package cmd
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"os"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -97,6 +100,36 @@ func makeDaemon(c *cli.Context, name, mp string, m meta.Meta) error {
 	return err
 }
 
+func fuseFlags() []cli.Flag {
+	return addCategories("FUSE", []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "enable-xattr",
+			Usage: "enable extended attributes (xattr)",
+		},
+		&cli.BoolFlag{
+			Name:  "enable-ioctl",
+			Usage: "enable ioctl (support GETFLAGS/SETFLAGS only)",
+		},
+		&cli.StringFlag{
+			Name:  "root-squash",
+			Usage: "mapping local root user (uid = 0) to another one specified as <uid>:<gid>",
+		},
+		&cli.BoolFlag{
+			Name:  "prefix-internal",
+			Usage: "add '.jfs' prefix to all internal files",
+		},
+		&cli.BoolFlag{
+			Name:   "non-default-permission",
+			Usage:  "disable `default_permissions` option, only for testing",
+			Hidden: true,
+		},
+		&cli.StringFlag{
+			Name:  "o",
+			Usage: "other FUSE options",
+		},
+	})
+}
+
 func mount_flags() []cli.Flag {
 	var defaultLogDir = "/var/log"
 	switch runtime.GOOS {
@@ -128,21 +161,41 @@ func mount_flags() []cli.Flag {
 			Value: path.Join(defaultLogDir, "juicefs.log"),
 			Usage: "path of log file when running in background",
 		},
-		&cli.StringFlag{
-			Name:  "o",
-			Usage: "other FUSE options",
-		},
 		&cli.BoolFlag{
-			Name:  "enable-xattr",
-			Usage: "enable extended attributes (xattr)",
+			Name:  "force",
+			Usage: "force to mount even if the mount point is already mounted by the same filesystem",
 		},
 	}
-	return append(selfFlags, cacheFlags(1.0)...)
+	if runtime.GOOS == "linux" {
+		selfFlags = append(selfFlags, &cli.BoolFlag{
+			Name:  "update-fstab",
+			Usage: "add / update entry in /etc/fstab, will create a symlink from /sbin/mount.juicefs to JuiceFS executable if not existing",
+		})
+	}
+	return append(selfFlags, fuseFlags()...)
 }
 
 func disableUpdatedb() {
 	path := "/etc/updatedb.conf"
-	data, err := ioutil.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	// obtain exclusive and not block flock
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if err == syscall.EAGAIN {
+			return
+		}
+	} else {
+		defer func() {
+			// release flock
+			_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		}()
+	}
+
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return
 	}
@@ -160,7 +213,7 @@ func disableUpdatedb() {
 		nd = append(nd, fstype...)
 		nd = append(nd, ' ')
 		nd = append(nd, data[p2:]...)
-		err = ioutil.WriteFile(path, nd, 0644)
+		err = os.WriteFile(path, nd, 0644)
 		if err != nil {
 			logger.Warnf("update %s: %s", path, err)
 		} else {
@@ -170,16 +223,51 @@ func disableUpdatedb() {
 }
 
 func mount_main(v *vfs.VFS, c *cli.Context) {
-	if os.Getuid() == 0 && os.Getpid() != 1 {
+	if os.Getuid() == 0 {
 		disableUpdatedb()
 	}
-
 	conf := v.Conf
 	conf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)
 	conf.EntryTimeout = time.Millisecond * time.Duration(c.Float64("entry-cache")*1000)
 	conf.DirEntryTimeout = time.Millisecond * time.Duration(c.Float64("dir-entry-cache")*1000)
+	conf.NonDefaultPermission = c.Bool("non-default-permission")
+	rootSquash := c.String("root-squash")
+	if rootSquash != "" {
+		var uid, gid uint32 = 65534, 65534
+		if u, err := user.Lookup("nobody"); err == nil {
+			nobody, err := strconv.ParseUint(u.Uid, 10, 32)
+			if err != nil {
+				logger.Fatalf("invalid uid: %s", u.Uid)
+			}
+			uid = uint32(nobody)
+		}
+		if g, err := user.LookupGroup("nogroup"); err == nil {
+			nogroup, err := strconv.ParseUint(g.Gid, 10, 32)
+			if err != nil {
+				logger.Fatalf("invalid gid: %s", g.Gid)
+			}
+			gid = uint32(nogroup)
+		}
+
+		ss := strings.SplitN(strings.TrimSpace(rootSquash), ":", 2)
+		if ss[0] != "" {
+			u, err := strconv.ParseUint(ss[0], 10, 32)
+			if err != nil {
+				logger.Fatalf("invalid uid: %s", ss[0])
+			}
+			uid = uint32(u)
+		}
+		if len(ss) == 2 && ss[1] != "" {
+			g, err := strconv.ParseUint(ss[1], 10, 32)
+			if err != nil {
+				logger.Fatalf("invalid gid: %s", ss[1])
+			}
+			gid = uint32(g)
+		}
+		conf.RootSquash = &vfs.RootSquash{Uid: uid, Gid: gid}
+	}
 	logger.Infof("Mounting volume %s at %s ...", conf.Format.Name, conf.Meta.MountPoint)
-	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"))
+	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
 	if err != nil {
 		logger.Fatalf("fuse: %s", err)
 	}

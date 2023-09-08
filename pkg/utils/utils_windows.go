@@ -18,6 +18,7 @@ package utils
 
 import (
 	"os"
+	"os/exec"
 
 	"golang.org/x/sys/windows"
 )
@@ -40,3 +41,10 @@ func GetFileInode(path string) (uint64, error) {
 func GetKernelVersion() (major, minor int) { return }
 
 func GetDev(fpath string) int { return -1 }
+
+func GetSysInfo() string {
+	sysInfo, _ := exec.Command("systeminfo").Output()
+	return string(sysInfo)
+}
+
+func GetUmask() int { return 0 }

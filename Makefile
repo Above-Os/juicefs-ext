@@ -3,7 +3,7 @@ export GO111MODULE=on
 all: juicefs
 
 REVISION := $(shell git rev-parse --short HEAD 2>/dev/null)
-REVISIONDATE := $(shell git log -1 --pretty=format:'%ad' --date short 2>/dev/null)
+REVISIONDATE := $(shell git log -1 --pretty=format:'%cd' --date short 2>/dev/null)
 PKG := github.com/juicedata/juicefs/pkg/version
 LDFLAGS = -s -w
 ifneq ($(strip $(REVISION)),) # Use git clone
@@ -30,6 +30,14 @@ juicefs.lite: Makefile cmd/*.go pkg/*/*.go
 juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
 	go build -tags ceph -ldflags="$(LDFLAGS)"  -o juicefs.ceph .
 
+juicefs.fdb: Makefile cmd/*.go pkg/*/*.go
+	go build -tags fdb -ldflags="$(LDFLAGS)"  -o juicefs.fdb .
+
+juicefs.gluster: Makefile cmd/*.go pkg/*/*.go
+	go build -tags gluster -ldflags="$(LDFLAGS)"  -o juicefs.gluster .
+
+juicefs.all: Makefile cmd/*.go pkg/*/*.go
+	go build -tags ceph,fdb,gluster -ldflags="$(LDFLAGS)"  -o juicefs.all .
 
 # This is the script for compiling the Linux version on the MacOS platform.
 # Please execute the `brew install FiloSottile/musl-cross/musl-cross` command before using it.
@@ -40,6 +48,8 @@ juicefs.linux:
 	sudo mkdir -p /usr/local/include/winfsp
 	sudo cp hack/winfsp_headers/* /usr/local/include/winfsp
 
+# This is the script for compiling the Windows version on the MacOS platform.
+# Please execute the `brew install mingw-w64` command before using it.
 juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 	GOOS=windows CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
 	     go build -ldflags="$(LDFLAGS)" -buildmode exe -o juicefs.exe .
@@ -66,6 +76,17 @@ release:
 		-w /go/src/github.com/juicedata/juicefs \
 		juicedata/golang-cross:v1.18 release --rm-dist
 
-test:
-	go test -v -cover ./pkg/... -coverprofile=cov1.out
-	sudo JFS_GC_SKIPPEDTIME=1 `which go` test -v -cover ./cmd/... -coverprofile=cov2.out -coverpkg=./pkg/...,./cmd/...
+test.meta.core:
+	SKIP_NON_CORE=true go test -v -cover -count=1  -failfast -timeout=12m ./pkg/meta/... -coverprofile=cov.out
+
+test.meta.non-core:
+	go test -v -cover -run='TestRedisCluster|TestPostgreSQLClient|TestLoadDumpSlow|TestEtcdClient|TestKeyDB' -count=1  -failfast -timeout=12m ./pkg/meta/... -coverprofile=cov.out
+
+test.pkg:
+	go test -tags gluster -v -cover -count=1  -failfast -timeout=12m $$(go list ./pkg/... | grep -v /meta) -coverprofile=cov.out
+
+test.cmd:
+	sudo JFS_GC_SKIPPEDTIME=1 MINIO_ACCESS_KEY=testUser MINIO_SECRET_KEY=testUserPassword GOMAXPROCS=8 go test -v -count=1 -failfast -cover -timeout=8m ./cmd/... -coverprofile=cov.out -coverpkg=./pkg/...,./cmd/...
+
+test.fdb:
+	go test -v -cover -count=1  -failfast -timeout=4m ./pkg/meta/ -tags fdb -run=TestFdb -coverprofile=cov.out

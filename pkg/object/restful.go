@@ -20,10 +20,10 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -38,7 +38,6 @@ var resolver = dnscache.New(time.Minute)
 var httpClient *http.Client
 
 func init() {
-	rand.Seed(time.Now().Unix())
 	httpClient = &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -77,6 +76,7 @@ func init() {
 				return nil, err
 			},
 			DisableCompression: true,
+			TLSClientConfig:    &tls.Config{},
 		},
 		Timeout: time.Hour,
 	}
@@ -88,7 +88,7 @@ func GetHttpClient() *http.Client {
 
 func cleanup(response *http.Response) {
 	if response != nil && response.Body != nil {
-		_, _ = ioutil.ReadAll(response.Body)
+		_, _ = io.ReadAll(response.Body)
 		_ = response.Body.Close()
 	}
 }
@@ -148,7 +148,7 @@ func (s *RestfulStorage) request(method, key string, body io.Reader, headers map
 }
 
 func parseError(resp *http.Response) error {
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("request failed: %s", err)
 	}
@@ -178,6 +178,7 @@ func (s *RestfulStorage) Head(key string) (Object, error) {
 		resp.ContentLength,
 		mtime,
 		strings.HasSuffix(key, "/"),
+		"",
 	}, nil
 }
 
@@ -240,7 +241,7 @@ func (s *RestfulStorage) Copy(dst, src string) error {
 		return err
 	}
 	defer in.Close()
-	d, err := ioutil.ReadAll(in)
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -259,7 +260,7 @@ func (s *RestfulStorage) Delete(key string) error {
 	return nil
 }
 
-func (s *RestfulStorage) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *RestfulStorage) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	return nil, notSupported
 }
 

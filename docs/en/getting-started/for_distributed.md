@@ -1,6 +1,7 @@
 ---
 sidebar_label: Quick Start (Distributed Mode)
 sidebar_position: 3
+description: This article will guide you through building a distributed, shared-access JuiceFS file system using cloud-based object storage and database.
 ---
 
 # Quick Start Guide for Distributed Mode
@@ -20,7 +21,7 @@ The meaning of "Network Database" here refers to the database that allows multip
 
 JuiceFS currently supports the following network-based databases.
 
-- **Key-Value Database**: Redis, TiKV
+- **Key-Value Database**: Redis, TiKV, etcd, FoundationDB
 - **Relational Database**: PostgreSQL, MySQL, MariaDB
 
 Different databases have different performance and stability. For example, Redis is an in-memory key-value database with an excellent performance but a relatively weak reliability, while PostgreSQL is a relational database which is more reliable but has a less excellent performance than the in-memory database.
@@ -46,7 +47,7 @@ Install the JuiceFS client on all computers that need to mount the file system, 
 
 ### 2. Preparing Object Storage
 
-Here is a pseudo sample with Amazon S3 as an example. You can also switch to other object storage (refer to [JuiceFS Supported Storage](../guide/how_to_set_up_object_storage.md#supported-object-storage) for details).
+Here is a pseudo sample with Amazon S3 as an example. You can also switch to other object storage (refer to [JuiceFS Supported Storage](../reference/how_to_set_up_object_storage.md#supported-object-storage) for details).
 
 - **Bucket Endpoint**: `https://myjfs.s3.us-west-1.amazonaws.com`
 - **Access Key ID**: `ABCDEFGHIJKLMNopqXYZ`
@@ -54,7 +55,7 @@ Here is a pseudo sample with Amazon S3 as an example. You can also switch to oth
 
 ### 3. Preparing Database
 
-Here is a pseudo sample with Amazon ElastiCache for Redis as an example. You can also switch to other types of databases (refer to [JuiceFS Supported Databases](../guide/how_to_set_up_metadata_engine.md) for details).
+Here is a pseudo sample with Amazon ElastiCache for Redis as an example. You can also switch to other types of databases (refer to [JuiceFS Supported Databases](../reference/how_to_set_up_metadata_engine.md) for details).
 
 - **Database Address**: `myjfs-sh-abc.apse1.cache.amazonaws.com:6379`
 - **Database Username**: `tom`
@@ -112,7 +113,7 @@ JuiceFS guarantees a "close-to-open" consistency, which means that when two or m
 
 #### Increase cache size to improve performance
 
-Since object storage is a network-based storage service, it will inevitably encounter access latency. To solve this problem, JuiceFS provides and enables caching mechanism by default, i.e. allocating a part of local storage as a buffer layer between data and object storage, and caching data asynchronously to local storage when reading files. Please refer to ["Cache"](../guide/cache_management.md) for more details.
+Since object storage is a network-based storage service, it will inevitably encounter access latency. To solve this problem, JuiceFS provides and enables caching mechanism by default, i.e. allocating a part of local storage as a buffer layer between data and object storage, and caching data asynchronously to local storage when reading files. Please refer to ["Cache"](../guide/cache.md) for more details.
 
 JuiceFS will set 100GiB cache in `$HOME/.juicefs/cache` or `/var/jfsCache` directory by default. Setting a larger cache space on a faster SSD can effectively improve read and write performance of JuiceFS even more .
 
@@ -135,21 +136,21 @@ The above command sets the cache directory in the `/mycache` directory and speci
 
 #### Auto-mount on boot
 
-Take a Linux system as an example and assume that the client is located in the `/usr/local/bin` directory. Rename the JuiceFS client to `mount.juicefs` and copy it to the `/sbin` directory.
-
-```shell
-sudo cp /usr/local/bin/juicefs /sbin/mount.juicefs
-```
-
-Edit the `/etc/fstab` configuration file and add a new record following the rules of fstab.
-
-```
-redis://tom:mypassword@myjfs-sh-abc.apse1.cache.amazonaws.com:6379/1    /mnt/myjfs    juicefs    _netdev,max-uploads=50,writeback,cache-size=512000     0  0
-```
+In a Linux environment, you can set up automatic mounting when mounting a file system via the `--update-fstab` option, which adds the options required to mount JuiceFS to `/etc/fstab`. For example:
 
 :::note
-By default, CentOS 6 does not mount the network file system during boot, you need to run the command `sudo chkconfig --add netfs` to enable automatically mounting.
+This feature requires JuiceFS version 1.1.0 and above
 :::
+
+```bash
+$ sudo juicefs mount --update-fstab --max-uploads=50 --writeback --cache-size 204800 redis://tom:mypassword@myjfs-sh-abc.apse1.cache.amazonaws.com:6379/1 <MOUNTPOINT>
+$ grep <MOUNTPOINT> /etc/fstab
+redis://tom:mypassword@myjfs-sh-abc.apse1.cache.amazonaws.com:6379/1 <MOUNTPOINT> juicefs _netdev,max-uploads=50,writeback,cache-size=204800 0 0
+$ ls -l /sbin/mount.juicefs
+lrwxrwxrwx 1 root root 29 Aug 11 16:43 /sbin/mount.juicefs -> /usr/local/bin/juicefs
+```
+
+Refer to ["Mount JuiceFS at Boot Time"](../administration/mount_at_boot.md) for more details.
 
 ### 6. Verify the file system
 

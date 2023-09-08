@@ -25,7 +25,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -61,14 +60,14 @@ func (c *etcdClient) Get(key string, off, limit int64) (io.ReadCloser, error) {
 			if limit > 0 && limit < int64(len(data)) {
 				data = data[:limit]
 			}
-			return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+			return io.NopCloser(bytes.NewBuffer(data)), nil
 		}
 	}
 	return nil, os.ErrNotExist
 }
 
 func (c *etcdClient) Put(key string, in io.Reader) error {
-	d, err := ioutil.ReadAll(in)
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -88,6 +87,7 @@ func (c *etcdClient) Head(key string) (Object, error) {
 				int64(len(p.Value)),
 				time.Now(),
 				strings.HasSuffix(key, "/"),
+				"",
 			}, nil
 		}
 	}
@@ -111,7 +111,10 @@ func genNextKey(key string) string {
 	return string(next)
 }
 
-func (c *etcdClient) List(prefix, marker string, limit int64) ([]Object, error) {
+func (c *etcdClient) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupported
+	}
 	if marker == "" {
 		marker = prefix
 	}
@@ -136,6 +139,7 @@ func (c *etcdClient) List(prefix, marker string, limit int64) ([]Object, error) 
 			int64(len(kv.Value)),
 			time.Now(),
 			strings.HasSuffix(k, "/"),
+			"",
 		})
 	}
 	return objs, nil

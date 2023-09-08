@@ -23,17 +23,21 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/erikdubbelboer/gspt"
-	"github.com/google/gops/agent"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/pyroscope-io/client/pyroscope"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	"go.uber.org/automaxprocs/maxprocs"
 )
 
 var logger = utils.GetLogger("juicefs")
+var debugAgent string
+var debugAgentOnce sync.Once
 
 func Main(args []string) error {
 	// we have to call this because gspt removes all arguments
@@ -53,9 +57,11 @@ func Main(args []string) error {
 		Commands: []*cli.Command{
 			cmdFormat(),
 			cmdConfig(),
+			cmdQuota(),
 			cmdDestroy(),
 			cmdGC(),
 			cmdFsck(),
+			cmdRestore(),
 			cmdDump(),
 			cmdLoad(),
 			cmdVersion(),
@@ -73,17 +79,27 @@ func Main(args []string) error {
 			cmdWarmup(),
 			cmdRmr(),
 			cmdSync(),
+			cmdDebug(),
+			cmdClone(),
+			cmdSummary(),
 		},
 	}
 
-	// Called via mount or fstab.
-	if strings.HasSuffix(args[0], "/mount.juicefs") {
+	if calledViaMount(args) {
 		args = handleSysMountArgs(args)
 		if len(args) < 1 {
 			args = []string{"mount", "--help"}
 		}
 	}
-	return app.Run(reorderOptions(app, args))
+	err := app.Run(reorderOptions(app, args))
+	if errno, ok := err.(syscall.Errno); ok && errno == 0 {
+		err = nil
+	}
+	return err
+}
+
+func calledViaMount(args []string) bool {
+	return strings.HasSuffix(args[0], "/mount.juicefs")
 }
 
 func handleSysMountArgs(args []string) []string {
@@ -119,7 +135,7 @@ func handleSysMountArgs(args []string) []string {
 		opts := strings.Split(option, ",")
 		for _, opt := range opts {
 			opt = strings.TrimSpace(opt)
-			if opt == "" || utils.StringContains(sysOptions, opt) {
+			if opt == "" || opt == "background" || utils.StringContains(sysOptions, opt) {
 				continue
 			}
 			// Lower case option name is preferred, but if it's the same as flag name, we also accept it
@@ -233,30 +249,47 @@ func setup(c *cli.Context, n int) {
 		os.Exit(1)
 	}
 
-	if c.Bool("trace") {
+	switch c.String("log-level") {
+	case "trace":
 		utils.SetLogLevel(logrus.TraceLevel)
-	} else if c.Bool("verbose") {
+	case "debug":
 		utils.SetLogLevel(logrus.DebugLevel)
-	} else if c.Bool("quiet") {
-		utils.SetLogLevel(logrus.WarnLevel)
-	} else {
+	case "info":
 		utils.SetLogLevel(logrus.InfoLevel)
+	case "warn":
+		utils.SetLogLevel(logrus.WarnLevel)
+	case "error":
+		utils.SetLogLevel(logrus.ErrorLevel)
+	case "fatal":
+		utils.SetLogLevel(logrus.FatalLevel)
+	case "panic":
+		utils.SetLogLevel(logrus.PanicLevel)
+	default:
+		if c.Bool("trace") {
+			utils.SetLogLevel(logrus.TraceLevel)
+		} else if c.Bool("verbose") {
+			utils.SetLogLevel(logrus.DebugLevel)
+		} else if c.Bool("quiet") {
+			utils.SetLogLevel(logrus.WarnLevel)
+		} else {
+			utils.SetLogLevel(logrus.InfoLevel)
+		}
 	}
 	if c.Bool("no-color") {
 		utils.DisableLogColor()
 	}
+	// set the correct value when it runs inside container
+	if undo, err := maxprocs.Set(maxprocs.Logger(logger.Debugf)); err != nil {
+		undo()
+	}
 
 	if !c.Bool("no-agent") {
-		go func() {
+		go debugAgentOnce.Do(func() {
 			for port := 6060; port < 6100; port++ {
-				_ = http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), nil)
+				debugAgent = fmt.Sprintf("127.0.0.1:%d", port)
+				_ = http.ListenAndServe(debugAgent, nil)
 			}
-		}()
-		go func() {
-			for port := 6070; port < 6100; port++ {
-				_ = agent.Listen(agent.Options{Addr: fmt.Sprintf("127.0.0.1:%d", port)})
-			}
-		}()
+		})
 	}
 
 	if c.IsSet("pyroscope") {
@@ -285,14 +318,16 @@ func setup(c *cli.Context, n int) {
 }
 
 func removePassword(uri string) {
+	args := make([]string, len(os.Args))
+	copy(args, os.Args)
 	uri2 := utils.RemovePassword(uri)
 	if uri2 != uri {
 		for i, a := range os.Args {
 			if a == uri {
-				os.Args[i] = uri2
+				args[i] = uri2
 				break
 			}
 		}
 	}
-	gspt.SetProcTitle(strings.Join(os.Args, " "))
+	gspt.SetProcTitle(strings.Join(args, " "))
 }

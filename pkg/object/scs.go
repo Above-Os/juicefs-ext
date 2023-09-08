@@ -35,6 +35,7 @@ import (
 )
 
 type scsClient struct {
+	DefaultObjectStorage
 	bucket string
 	c      *scs.SCS
 	b      scs.Bucket
@@ -43,6 +44,13 @@ type scsClient struct {
 
 func (s *scsClient) String() string {
 	return fmt.Sprintf("scs://%s/", s.bucket)
+}
+
+func (s *scsClient) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  false,
+	}
 }
 
 func (s *scsClient) Create() error {
@@ -89,7 +97,7 @@ func (s *scsClient) Delete(key string) error {
 	return s.b.Delete(key)
 }
 
-func (s *scsClient) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *scsClient) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	if marker != "" {
 		if s.marker == "" {
 			// last page
@@ -97,7 +105,7 @@ func (s *scsClient) List(prefix, marker string, limit int64) ([]Object, error) {
 		}
 		marker = s.marker
 	}
-	list, err := s.b.List("", prefix, marker, limit)
+	list, err := s.b.List(delimiter, prefix, marker, limit)
 	if err != nil {
 		s.marker = ""
 		return nil, err
@@ -119,11 +127,13 @@ func (s *scsClient) List(prefix, marker string, limit int64) ([]Object, error) {
 			isDir: strings.HasSuffix(ob.Name, "/"),
 		}
 	}
+	if delimiter != "" {
+		for _, p := range list.CommonPrefixes {
+			objs = append(objs, &obj{p.Prefix, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
 	return objs, nil
-}
-
-func (s *scsClient) ListAll(prefix, marker string) (<-chan Object, error) {
-	return nil, notSupported
 }
 
 func (s *scsClient) CreateMultipartUpload(key string) (*MultipartUpload, error) {

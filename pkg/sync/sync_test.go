@@ -18,7 +18,7 @@ package sync
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"reflect"
@@ -44,7 +44,7 @@ func TestIterator(t *testing.T) {
 	m.Put("aa", bytes.NewReader([]byte("a")))
 	m.Put("c", bytes.NewReader([]byte("a")))
 
-	ch, _ := ListAll(m, "a", "b")
+	ch, _ := ListAll(m, "", "a", "b", true)
 	keys := collectAll(ch)
 	if len(keys) != 3 {
 		t.Fatalf("length should be 3, but got %d", len(keys))
@@ -56,7 +56,7 @@ func TestIterator(t *testing.T) {
 	// Single object
 	s, _ := object.CreateStorage("mem", "", "", "", "")
 	s.Put("a", bytes.NewReader([]byte("a")))
-	ch, _ = ListAll(s, "", "")
+	ch, _ = ListAll(s, "", "", "", true)
 	keys = collectAll(ch)
 	if !reflect.DeepEqual(keys, []string{"a"}) {
 		t.Fatalf("result wrong: %s", keys)
@@ -75,7 +75,7 @@ func TestIeratorSingleEmptyKey(t *testing.T) {
 
 	// Simulate command line prefix in SRC or DST
 	s = object.WithPrefix(s, "abc")
-	ch, _ := ListAll(s, "", "")
+	ch, _ := ListAll(s, "", "", "", true)
 	keys := collectAll(ch)
 	if !reflect.DeepEqual(keys, []string{""}) {
 		t.Fatalf("result wrong: %s", keys)
@@ -131,24 +131,25 @@ func TestSync(t *testing.T) {
 	if err := Sync(a, b, config); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
-	// No copy occured
+	// No copy occurred
 	if c := copied.Current(); c != 0 {
 		t.Fatalf("should copy 0 keys, but got %d", c)
 	}
 
-	// Now a: {"a1", "a2", "abc","c1","c2"}, b: {"a1", "ba"}
+	// Now a: {"a1", "a2", "abc", "c1", "c2"}, b: {"a1", "a2", "ba"}
 	// Copy "ba" from b to a
 	os.Args = []string{}
 	config.Exclude = nil
+	config.rules = nil
 	if err := Sync(b, a, config); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
 	if c := copied.Current(); c != 1 {
 		t.Fatalf("should copy 1 keys, but got %d", c)
 	}
-	// Now a: {"a1", "a2", "abc","c1","c2","ba"}, b: {"a1", "ba"}
-	aRes, _ := a.ListAll("", "")
-	bRes, _ := b.ListAll("", "")
+	// Now a: {"a1", "a2", "abc", "ba", "c1", "c2"}, b: {"a1", "a2", "ba"}
+	aRes, _ := ListAll(a, "", "", "", true)
+	bRes, _ := ListAll(b, "", "", "", true)
 
 	var aObjs, bObjs []object.Object
 	for obj := range aRes {
@@ -163,7 +164,7 @@ func TestSync(t *testing.T) {
 	}
 
 	if !deepEqualWithOutMtime(aObjs[4], bObjs[len(bObjs)-1]) {
-		t.FailNow()
+		t.Fatalf("expect %+v but got %+v", aObjs[4], bObjs[len(bObjs)-1])
 	}
 	// Test --force-update option
 	config.ForceUpdate = true
@@ -248,7 +249,7 @@ func TestSyncIncludeAndExclude(t *testing.T) {
 			t.Fatalf("sync: %s", err)
 		}
 
-		bRes, _ := b.ListAll("", "")
+		bRes, _ := ListAll(b, "", "", "", true)
 		var bKeys []string
 		for obj := range bRes {
 			bKeys = append(bKeys, obj.Key())
@@ -341,7 +342,7 @@ func TestSyncLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get content failed: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content failed: err %s content %s", err, string(c))
 	}
 
@@ -353,7 +354,7 @@ func TestSyncLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("content failed: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content failed: err %s content %s", err, string(c))
 	}
 
@@ -391,7 +392,7 @@ func TestSyncLinkWithOutFollow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get content error: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content error: %s", err)
 	}
 
@@ -480,7 +481,7 @@ func TestLimits(t *testing.T) {
 			t.Fatalf("sync: %s", err)
 		}
 
-		all, err := tcase.dst.ListAll("", "")
+		all, err := ListAll(tcase.dst, "", "", "", true)
 		if err != nil {
 			t.Fatalf("list all b: %s", err)
 		}

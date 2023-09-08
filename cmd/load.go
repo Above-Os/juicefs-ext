@@ -43,6 +43,11 @@ func cmdLoad() *cli.Command {
 				Name:  "encrypt-rsa-key",
 				Usage: "a path to RSA private key (PEM)",
 			},
+			&cli.StringFlag{
+				Name:  "encrypt-algo",
+				Usage: "encrypt algorithm (aes256gcm-rsa, chacha20-rsa)",
+				Value: object.AES256GCM_RSA,
+			},
 		},
 		Usage:     "Load metadata from a previously dumped JSON file",
 		ArgsUsage: "META-URL [FILE]",
@@ -53,7 +58,7 @@ WARNING: Do NOT use new engine and the old one at the same time, otherwise it wi
 consistency of the volume.
 
 Examples:
-$ juicefs load redis://localhost/1 meta-dump
+$ juicefs load redis://localhost/1 meta-dump.json.gz
 
 Details: https://juicefs.com/docs/community/metadata_dump_load`,
 	}
@@ -85,7 +90,7 @@ func load(ctx *cli.Context) error {
 			if err != nil {
 				return fmt.Errorf("parse rsa: %s", err)
 			}
-			encryptor := object.NewAESEncryptor(object.NewRSAEncryptor(privKey))
+			encryptor, err := object.NewDataEncryptor(object.NewRSAEncryptor(privKey), ctx.String("encrypt-algo"))
 			if err != nil {
 				return err
 			}
@@ -121,7 +126,7 @@ func load(ctx *cli.Context) error {
 			r = fp
 		}
 	}
-	m := meta.NewClient(metaUri, &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(metaUri, nil)
 	if format, err := m.Load(false); err == nil {
 		return fmt.Errorf("Database %s is used by volume %s", utils.RemovePassword(metaUri), format.Name)
 	}

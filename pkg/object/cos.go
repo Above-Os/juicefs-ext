@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,10 +37,12 @@ import (
 )
 
 const cosChecksumKey = "x-cos-meta-" + checksumAlgr
+const cosRequestIDKey = "X-Cos-Request-Id"
 
 type COS struct {
 	c        *cos.Client
 	endpoint string
+	sc       string
 }
 
 func (c *COS) String() string {
@@ -52,6 +55,16 @@ func (c *COS) Create() error {
 		err = nil
 	}
 	return err
+}
+
+func (c *COS) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              1 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
 }
 
 func (c *COS) Head(key string) (Object, error) {
@@ -73,8 +86,15 @@ func (c *COS) Head(key string) (Object, error) {
 	if val, ok := header["Last-Modified"]; ok {
 		mtime, _ = time.Parse(time.RFC1123, val[0])
 	}
-
-	return &obj{key, size, mtime, strings.HasSuffix(key, "/")}, nil
+	var sc string
+	if val, ok := header["X-Cos-Storage-Class"]; ok {
+		sc = val[0]
+	} else {
+		// https://cloud.tencent.com/document/product/436/7745
+		// This header is returned only if the object is not STANDARD storage class.
+		sc = "STANDARD"
+	}
+	return &obj{key, size, mtime, strings.HasSuffix(key, "/"), sc}, nil
 }
 
 func (c *COS) Get(key string, off, limit int64) (io.ReadCloser, error) {
@@ -90,37 +110,57 @@ func (c *COS) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if off == 0 && limit == -1 {
 		resp.Body = verifyChecksum(resp.Body, resp.Header.Get(cosChecksumKey))
 	}
+	if resp != nil {
+		ReqIDCache.put(key, resp.Header.Get(cosRequestIDKey))
+	}
 	return resp.Body, nil
 }
 
 func (c *COS) Put(key string, in io.Reader) error {
-	var options *cos.ObjectPutOptions
+	var options cos.ObjectPutOptions
 	if ins, ok := in.(io.ReadSeeker); ok {
 		header := http.Header(map[string][]string{
 			cosChecksumKey: {generateChecksum(ins)},
 		})
-		options = &cos.ObjectPutOptions{ObjectPutHeaderOptions: &cos.ObjectPutHeaderOptions{XCosMetaXXX: &header}}
+		options.ObjectPutHeaderOptions = &cos.ObjectPutHeaderOptions{XCosMetaXXX: &header}
 	}
-	_, err := c.c.Object.Put(ctx, key, in, options)
+	if c.sc != "" {
+		if options.ObjectPutHeaderOptions == nil {
+			options.ObjectPutHeaderOptions = &cos.ObjectPutHeaderOptions{}
+		}
+		options.ObjectPutHeaderOptions.XCosStorageClass = c.sc
+	}
+	resp, err := c.c.Object.Put(ctx, key, in, &options)
+	if resp != nil {
+		ReqIDCache.put(key, resp.Header.Get(cosRequestIDKey))
+	}
 	return err
 }
 
 func (c *COS) Copy(dst, src string) error {
+	var opt cos.ObjectCopyOptions
+	if c.sc != "" {
+		opt.ObjectCopyHeaderOptions = &cos.ObjectCopyHeaderOptions{XCosStorageClass: c.sc}
+	}
 	source := fmt.Sprintf("%s/%s", c.endpoint, src)
-	_, _, err := c.c.Object.Copy(ctx, dst, source, nil)
+	_, _, err := c.c.Object.Copy(ctx, dst, source, &opt)
 	return err
 }
 
 func (c *COS) Delete(key string) error {
-	_, err := c.c.Object.Delete(ctx, key)
+	resp, err := c.c.Object.Delete(ctx, key)
+	if resp != nil {
+		ReqIDCache.put(key, resp.Header.Get(cosRequestIDKey))
+	}
 	return err
 }
 
-func (c *COS) List(prefix, marker string, limit int64) ([]Object, error) {
+func (c *COS) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	param := cos.BucketGetOptions{
 		Prefix:       prefix,
 		Marker:       marker,
 		MaxKeys:      int(limit),
+		Delimiter:    delimiter,
 		EncodingType: "url",
 	}
 	resp, _, err := c.c.Bucket.Get(ctx, &param)
@@ -142,17 +182,31 @@ func (c *COS) List(prefix, marker string, limit int64) ([]Object, error) {
 		if err != nil {
 			return nil, errors.WithMessagef(err, "failed to decode key %s", o.Key)
 		}
-		objs[i] = &obj{key, int64(o.Size), t, strings.HasSuffix(key, "/")}
+		objs[i] = &obj{key, int64(o.Size), t, strings.HasSuffix(key, "/"), o.StorageClass}
+	}
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			key, err := cos.DecodeURIComponent(p)
+			if err != nil {
+				return nil, errors.WithMessagef(err, "failed to decode commonPrefixes %s", p)
+			}
+			objs = append(objs, &obj{key, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
 }
 
-func (c *COS) ListAll(prefix, marker string) (<-chan Object, error) {
+func (c *COS) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
 func (c *COS) CreateMultipartUpload(key string) (*MultipartUpload, error) {
-	resp, _, err := c.c.Object.InitiateMultipartUpload(ctx, key, nil)
+	var options cos.InitiateMultipartUploadOptions
+	if c.sc != "" {
+		options.ObjectPutHeaderOptions = &cos.ObjectPutHeaderOptions{XCosStorageClass: c.sc}
+	}
+	resp, _, err := c.c.Object.InitiateMultipartUpload(ctx, key, &options)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +219,16 @@ func (c *COS) UploadPart(key string, uploadID string, num int, body []byte) (*Pa
 		return nil, err
 	}
 	return &Part{Num: num, ETag: resp.Header.Get("Etag")}, nil
+}
+
+func (c *COS) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	result, _, err := c.c.Object.CopyPart(ctx, key, uploadID, num, c.endpoint+"/"+srcKey, &cos.ObjectCopyPartOptions{
+		XCosCopySourceRange: fmt.Sprintf("bytes=%d-%d", off, off+size-1),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: result.ETag}, nil
 }
 
 func (c *COS) AbortUpload(key string, uploadID string) {
@@ -194,6 +258,10 @@ func (c *COS) ListUploads(marker string) ([]*PendingPart, string, error) {
 		parts[i] = &PendingPart{u.Key, u.UploadID, t}
 	}
 	return parts, result.NextKeyMarker, nil
+}
+
+func (c *COS) SetStorageClass(sc string) {
+	c.sc = sc
 }
 
 func autoCOSEndpoint(bucketName, accessKey, secretKey, token string) (string, error) {
@@ -255,7 +323,7 @@ func newCOS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		},
 	})
 	client.UserAgent = UserAgent
-	return &COS{client, uri.Host}, nil
+	return &COS{c: client, endpoint: uri.Host}, nil
 }
 
 func init() {

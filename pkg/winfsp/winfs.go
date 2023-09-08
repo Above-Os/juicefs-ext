@@ -89,7 +89,7 @@ func (j *juice) Statfs(path string, stat *fuse.Statfs_t) int {
 	ctx := j.newContext()
 	// defer trace(path)(stat)
 	var totalspace, availspace, iused, iavail uint64
-	j.fs.Meta().StatFS(ctx, &totalspace, &availspace, &iused, &iavail)
+	j.fs.Meta().StatFS(ctx, meta.RootInode, &totalspace, &availspace, &iused, &iavail)
 	var bsize uint64 = 4096
 	blocks := totalspace / bsize
 	bavail := availspace / bsize
@@ -132,7 +132,7 @@ func (j *juice) Mkdir(path string, mode uint32) (e int) {
 	}
 	ctx := j.newContext()
 	defer trace(path, mode)(&e)
-	e = errorconv(j.fs.Mkdir(ctx, path, uint16(mode)))
+	e = errorconv(j.fs.Mkdir(ctx, path, uint16(mode), 0))
 	return
 }
 
@@ -498,7 +498,7 @@ func (j *juice) Opendir(path string) (e int, fh uint64) {
 		e = -fuse.ENOENT
 		return
 	}
-	fh, errno := j.vfs.Opendir(ctx, f.Inode())
+	fh, errno := j.vfs.Opendir(ctx, f.Inode(), 0)
 	if errno == 0 {
 		j.Lock()
 		j.handlers[fh] = f.Inode()

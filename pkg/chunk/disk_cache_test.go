@@ -17,16 +17,204 @@
 package chunk
 
 import (
+	"crypto/rand"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
+
+// Copy from https://github.com/prometheus/client_golang/blob/v1.14.0/prometheus/testutil/testutil.go
+func toFloat64(c prometheus.Collector) float64 {
+	var (
+		m      prometheus.Metric
+		mCount int
+		mChan  = make(chan prometheus.Metric)
+		done   = make(chan struct{})
+	)
+
+	go func() {
+		for m = range mChan {
+			mCount++
+		}
+		close(done)
+	}()
+
+	c.Collect(mChan)
+	close(mChan)
+	<-done
+
+	if mCount != 1 {
+		panic(fmt.Errorf("collected %d metrics instead of exactly 1", mCount))
+	}
+
+	pb := &dto.Metric{}
+	if err := m.Write(pb); err != nil {
+		panic(fmt.Errorf("error happened while collecting metrics: %w", err))
+	}
+	if pb.Gauge != nil {
+		return pb.Gauge.GetValue()
+	}
+	if pb.Counter != nil {
+		return pb.Counter.GetValue()
+	}
+	if pb.Untyped != nil {
+		return pb.Untyped.GetValue()
+	}
+	panic(fmt.Errorf("collected a non-gauge/counter/untyped metric: %s", pb))
+}
 
 func TestNewCacheStore(t *testing.T) {
 	s := newCacheStore(nil, defaultConf.CacheDir, 1<<30, 1, &defaultConf, nil)
 	if s == nil {
 		t.Fatalf("Create new cache store failed")
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	m := newCacheManager(&defaultConf, nil, nil)
+	metrics := m.(*cacheManager).metrics
+	s := m.(*cacheManager).stores[0]
+	content := []byte("helloworld")
+	p := NewPage(content)
+	s.cache("test", p, true)
+	// Waiting for the cache to be flushed
+	time.Sleep(time.Millisecond * 100)
+	if toFloat64(metrics.cacheWrites) != 1.0 {
+		t.Fatalf("expect the cacheWrites is 1")
+	}
+
+	if toFloat64(metrics.cacheWriteBytes) != float64(len(content)) {
+		t.Fatalf("expect the cacheWriteBytes is %d", len(content))
+	}
+
+	if toFloat64(metrics.stageBlocks) != 0.0 {
+		t.Fatalf("expect the stageBlocks is %d", len(content))
+	}
+
+	if toFloat64(metrics.stageBlockBytes) != 0.0 {
+		t.Fatalf("expect the stageBlockBytes is %d", len(content))
+	}
+	key := fmt.Sprintf("chunks/0/5/5000_2_%d", len(content))
+	stagingPath, err := m.stage(key, content, false)
+	if err != nil {
+		t.Fatalf("stage failed: %s", err)
+	}
+	if toFloat64(metrics.stageBlocks) != 1.0 {
+		t.Fatalf("expect the stageBlocks is %d", len(content))
+	}
+
+	if toFloat64(metrics.stageBlockBytes) != float64(len(content)) {
+		t.Fatalf("expect the stageBlockBytes is %d", len(content))
+	}
+	err = m.removeStage(key)
+	if err != nil {
+		t.Fatalf("faild to remove stage")
+	}
+
+	if toFloat64(metrics.stageBlocks) != 0.0 {
+		t.Fatalf("expect the stageBlocks is %d", len(content))
+	}
+
+	if toFloat64(metrics.stageBlockBytes) != 0.0 {
+		t.Fatalf("expect the stageBlockBytes is %d", len(content))
+	}
+
+	if _, err := os.Stat(stagingPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("expect the stageingPath %s not exists", stagingPath)
+	}
+}
+
+func TestChecksum(t *testing.T) {
+	m := newCacheManager(&defaultConf, nil, nil)
+	s := m.(*cacheManager).stores[0]
+	k1 := "0_0_10" // no checksum
+	k2 := "1_0_10"
+	k3 := "2_1_102400"
+	k4 := "3_5_102400" // corrupt data
+	k5 := "4_8_1048576"
+
+	p := NewPage([]byte("helloworld"))
+	s.cache(k1, p, true)
+
+	s.checksum = CsFull
+	s.cache(k2, p, true)
+
+	buf := make([]byte, 102400)
+	_, _ = rand.Read(buf)
+	s.cache(k3, NewPage(buf), true)
+
+	fpath := s.cachePath(k4)
+	f, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE, s.mode)
+	if err != nil {
+		t.Fatalf("Create cache file %s: %s", fpath, err)
+	}
+	if _, err = f.Write(buf); err != nil {
+		_ = f.Close()
+		t.Fatalf("Write cache file %s: %s", fpath, err)
+	}
+	corrupt := make([]byte, 102400)
+	copy(corrupt, buf)
+	for i := 98304; i < 102400; i++ { // reset 96K ~ 100K
+		corrupt[i] = 0
+	}
+	if _, err = f.Write(checksum(corrupt)); err != nil {
+		_ = f.Close()
+		t.Fatalf("Write checksum to cache file %s: %s", fpath, err)
+	}
+	_ = f.Close()
+	s.add(k4, 102400, uint32(time.Now().Unix()))
+
+	buf = make([]byte, 1048576)
+	_, _ = rand.Read(buf)
+	s.cache(k5, NewPage(buf), true)
+	time.Sleep(time.Second * 5) // wait for cache file flushed
+
+	check := func(key string, off int64, size int) error {
+		rc, err := s.load(key)
+		if err != nil {
+			t.Fatalf("CacheStore load key %s: %s", key, err)
+		}
+		defer rc.Close()
+		buf := make([]byte, size)
+		_, err = rc.ReadAt(buf, off)
+		return err
+	}
+	cases := []struct {
+		key    string
+		off    int64
+		size   int
+		expect bool
+	}{
+		{k1, 0, 10, true},
+		{k1, 3, 5, true},
+		{k2, 0, 10, true},
+		{k2, 3, 5, true},
+		{k3, 0, 102400, true},
+		{k3, 8192, 92160, true}, // 8K ~ 98K
+		{k4, 0, 102400, true},
+		{k4, 8192, 92160, true}, // only CsExtend can detect the error
+		{k5, 0, 1048576, true},
+		{k5, 131072, 131072, true},
+		{k5, 102400, 512000, true},
+	}
+	for _, l := range []string{CsNone, CsFull, CsShrink, CsExtend} {
+		s.checksum = l
+		if l != CsNone {
+			cases[6].expect = false
+		}
+		if l == CsExtend {
+			cases[7].expect = false
+		}
+		for _, c := range cases {
+			if err = check(c.key, c.off, c.size); (err == nil) != c.expect {
+				t.Fatalf("CacheStore check level %s case %+v: %s", l, c, err)
+			}
+		}
 	}
 }
 
