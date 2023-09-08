@@ -52,7 +52,7 @@ func Backup(m meta.Meta, blob object.ObjectStorage, interval time.Duration) {
 		if now := time.Now(); now.Sub(last) >= interval {
 			if interval <= time.Hour {
 				var iused, dummy uint64
-				_ = m.StatFS(ctx, &dummy, &dummy, &iused, &dummy)
+				_ = m.StatFS(ctx, meta.RootInode, &dummy, &dummy, &iused, &dummy)
 				if iused > 1e6 {
 					logger.Warnf("backup metadata skipped because of too many inodes: %d %s; "+
 						"you may increase `--backup-meta` to enable it again", iused, interval)
@@ -83,7 +83,7 @@ func backup(m meta.Meta, blob object.ObjectStorage, now time.Time) error {
 	defer os.Remove(fp.Name())
 	defer fp.Close()
 	zw := gzip.NewWriter(fp)
-	err = m.DumpMeta(zw, 0) // force dump the whole tree
+	err = m.DumpMeta(zw, 0, false) // force dump the whole tree
 	_ = zw.Close()
 	if err != nil {
 		return err
@@ -96,7 +96,7 @@ func backup(m meta.Meta, blob object.ObjectStorage, now time.Time) error {
 
 func cleanupBackups(blob object.ObjectStorage, now time.Time) {
 	blob = object.WithPrefix(blob, "meta/")
-	ch, err := osync.ListAll(blob, "", "")
+	ch, err := osync.ListAll(blob, "", "", "", true)
 	if err != nil {
 		logger.Warnf("listAll prefix meta/: %s", err)
 		return

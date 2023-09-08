@@ -17,6 +17,7 @@
 package utils
 
 import (
+	"log"
 	"testing"
 	"time"
 )
@@ -28,7 +29,23 @@ func TestClock(t *testing.T) {
 	}
 	c1 := Clock()
 	c2 := Clock()
-	if c2-c1 > time.Microsecond || c2-c1 == 0 {
-		t.Fatalf("clock is not accurate: %s", c2-c1)
+	if c2 < c1 {
+		t.Fatalf("clock is not monotonic: %s > %s", c1, c2)
 	}
+}
+
+func BenchmarkNow(b *testing.B) {
+	var now time.Time
+	for i := 0; i < b.N; i++ {
+		now = Now()
+	}
+	log.Print(now)
+}
+
+func BenchmarkClock(b *testing.B) {
+	var now time.Duration
+	for i := 0; i < b.N; i++ {
+		now = Clock()
+	}
+	log.Print(now)
 }

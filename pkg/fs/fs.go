@@ -40,9 +40,6 @@ import (
 
 var logger = utils.GetLogger("juicefs")
 
-var checkAccessFile = time.Minute
-var rotateAccessLog int64 = 300 << 20 // 300 MiB
-
 type Ino = meta.Ino
 type Attr = meta.Attr
 type LogContext = vfs.LogContext
@@ -133,11 +130,12 @@ type FileSystem struct {
 	writer vfs.DataWriter
 	m      meta.Meta
 
-	cacheM  sync.Mutex
-	entries map[Ino]map[string]*entryCache
-	attrs   map[Ino]*attrCache
-
-	logBuffer chan string
+	cacheM          sync.Mutex
+	entries         map[Ino]map[string]*entryCache
+	attrs           map[Ino]*attrCache
+	checkAccessFile time.Duration
+	rotateAccessLog int64
+	logBuffer       chan string
 
 	readSizeHistogram     prometheus.Histogram
 	writtenSizeHistogram  prometheus.Histogram
@@ -162,12 +160,14 @@ type File struct {
 func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore) (*FileSystem, error) {
 	reader := vfs.NewDataReader(conf, m, d)
 	fs := &FileSystem{
-		m:       m,
-		conf:    conf,
-		reader:  reader,
-		writer:  vfs.NewDataWriter(conf, m, d, reader),
-		entries: make(map[meta.Ino]map[string]*entryCache),
-		attrs:   make(map[meta.Ino]*attrCache),
+		m:               m,
+		conf:            conf,
+		reader:          reader,
+		writer:          vfs.NewDataWriter(conf, m, d, reader),
+		entries:         make(map[meta.Ino]map[string]*entryCache),
+		attrs:           make(map[meta.Ino]*attrCache),
+		checkAccessFile: time.Minute,
+		rotateAccessLog: 300 << 20, // 300 MiB
 
 		readSizeHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "sdk_read_size_bytes",
@@ -299,16 +299,16 @@ func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
 			logger.Errorf("write access log: %s", err)
 			break
 		}
-		if lastcheck.Add(checkAccessFile).After(time.Now()) {
+		if lastcheck.Add(fs.checkAccessFile).After(time.Now()) {
 			continue
 		}
 		lastcheck = time.Now()
 		var fi os.FileInfo
 		fi, err = f.Stat()
-		if err == nil && fi.Size() > rotateAccessLog {
+		if err == nil && fi.Size() > fs.rotateAccessLog {
 			_ = f.Close()
 			fi, err = os.Stat(path)
-			if err == nil && fi.Size() > rotateAccessLog {
+			if err == nil && fi.Size() > fs.rotateAccessLog {
 				tmp := fmt.Sprintf("%s.%p", path, fs)
 				if os.Rename(path, tmp) == nil {
 					for i := 6; i > 0; i-- {
@@ -317,7 +317,7 @@ func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
 					_ = os.Rename(tmp, path+".1")
 				} else {
 					fi, err = os.Stat(path)
-					if err == nil && fi.Size() > rotateAccessLog*7 {
+					if err == nil && fi.Size() > fs.rotateAccessLog*7 {
 						logger.Infof("can't rename %s, truncate it", path)
 						_ = os.Truncate(path, 0)
 					}
@@ -342,7 +342,7 @@ func (fs *FileSystem) StatFS(ctx meta.Context) (totalspace uint64, availspace ui
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "StatFS (): (%d,%d)", totalspace, availspace) }()
 	var iused, iavail uint64
-	_ = fs.m.StatFS(ctx, &totalspace, &availspace, &iused, &iavail)
+	_ = fs.m.StatFS(ctx, meta.RootInode, &totalspace, &availspace, &iused, &iavail)
 	return
 }
 
@@ -362,10 +362,6 @@ func (fs *FileSystem) Open(ctx meta.Context, path string, flags uint32) (f *File
 	}
 
 	if flags != 0 && !fi.IsDir() {
-		err = fs.m.Access(ctx, fi.inode, uint8(flags), fi.attr)
-		if err != 0 {
-			return nil, err
-		}
 		var oflags uint32 = syscall.O_RDONLY
 		if flags == vfs.MODE_MASK_W {
 			oflags = syscall.O_WRONLY
@@ -421,7 +417,7 @@ func parentDir(p string) string {
 	return path.Dir(strings.TrimRight(p, "/"))
 }
 
-func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16) (err syscall.Errno) {
+func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16, umask uint16) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Mkdir").End()
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "Mkdir (%s, %o): %s", p, mode, errstr(err)) }()
@@ -432,14 +428,36 @@ func (fs *FileSystem) Mkdir(ctx meta.Context, p string, mode uint16) (err syscal
 	if err != 0 {
 		return err
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
-	if err != 0 {
-		return err
-	}
 	var inode Ino
-	err = fs.m.Mkdir(ctx, fi.inode, path.Base(p), mode, 0, 0, &inode, nil)
+	err = fs.m.Mkdir(ctx, fi.inode, path.Base(p), mode, umask, 0, &inode, nil)
+	if err == syscall.ENOENT && fi.inode != 1 {
+		// parent be moved into trash, try again
+		if fs.conf.DirEntryTimeout > 0 {
+			parent := parentDir(p)
+			if fi, err := fs.resolve(ctx, parentDir(parent), true); err == 0 {
+				fs.invalidateEntry(fi.inode, path.Base(parent))
+			}
+		}
+		if fi2, e := fs.resolve(ctx, parentDir(p), true); e != 0 {
+			return e
+		} else if fi2.inode != fi.inode {
+			err = fs.m.Mkdir(ctx, fi2.inode, path.Base(p), mode, umask, 0, &inode, nil)
+		}
+	}
 	fs.invalidateEntry(fi.inode, path.Base(p))
 	return
+}
+
+func (fs *FileSystem) MkdirAll(ctx meta.Context, p string, mode uint16, umask uint16) (err syscall.Errno) {
+	err = fs.Mkdir(ctx, p, mode, umask)
+	if err == syscall.ENOENT {
+		_ = fs.MkdirAll(ctx, parentDir(p), mode, umask)
+		err = fs.Mkdir(ctx, p, mode, umask)
+	}
+	if err == syscall.EEXIST {
+		err = 0
+	}
+	return err
 }
 
 func (fs *FileSystem) Delete(ctx meta.Context, p string) (err syscall.Errno) {
@@ -453,10 +471,6 @@ func (fs *FileSystem) Delete(ctx meta.Context, p string) (err syscall.Errno) {
 	fi, err := fs.resolve(ctx, p, false)
 	if err != 0 {
 		return
-	}
-	err = fs.m.Access(ctx, parent.inode, mMaskW, parent.attr)
-	if err != 0 {
-		return err
 	}
 	if fi.IsDir() {
 		err = fs.m.Rmdir(ctx, parent.inode, path.Base(p))
@@ -488,15 +502,7 @@ func (fs *FileSystem) Rename(ctx meta.Context, oldpath string, newpath string, f
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, oldfi.inode, mMaskW, oldfi.attr)
-	if err != 0 {
-		return
-	}
 	newfi, err := fs.resolve(ctx, parentDir(newpath), true)
-	if err != 0 {
-		return
-	}
-	err = fs.m.Access(ctx, newfi.inode, mMaskW, newfi.attr)
 	if err != 0 {
 		return
 	}
@@ -522,10 +528,6 @@ func (fs *FileSystem) Symlink(ctx meta.Context, target string, link string) (err
 		// external link
 		rel = target
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
-	if err != 0 {
-		return
-	}
 	err = fs.m.Symlink(ctx, fi.inode, path.Base(link), rel, nil, nil)
 	fs.invalidateEntry(fi.inode, path.Base(link))
 	return
@@ -543,12 +545,6 @@ func (fs *FileSystem) Readlink(ctx meta.Context, link string) (path []byte, err 
 	return
 }
 
-const (
-	mMaskR = 4
-	mMaskW = 2
-	mMaskX = 1
-)
-
 func (fs *FileSystem) Truncate(ctx meta.Context, path string, length uint64) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Truncate").End()
 	l := vfs.NewLogContext(ctx)
@@ -557,11 +553,7 @@ func (fs *FileSystem) Truncate(ctx meta.Context, path string, length uint64) (er
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
-	if err != 0 {
-		return
-	}
-	err = fs.m.Truncate(ctx, fi.inode, 0, length, nil)
+	err = fs.m.Truncate(ctx, fi.inode, 0, length, nil, false)
 	return
 }
 
@@ -576,15 +568,7 @@ func (fs *FileSystem) CopyFileRange(ctx meta.Context, src string, soff uint64, d
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, dfi.inode, mMaskW, dfi.attr)
-	if err != 0 {
-		return
-	}
 	sfi, err = fs.resolve(ctx, src, true)
-	if err != 0 {
-		return
-	}
-	err = fs.m.Access(ctx, sfi.inode, mMaskR, sfi.attr)
 	if err != 0 {
 		return
 	}
@@ -600,10 +584,6 @@ func (fs *FileSystem) SetXattr(ctx meta.Context, p string, name string, value []
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
-	if err != 0 {
-		return
-	}
 	err = fs.m.SetXattr(ctx, fi.inode, name, value, flags)
 	return
 }
@@ -613,10 +593,6 @@ func (fs *FileSystem) GetXattr(ctx meta.Context, p string, name string) (result 
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "GetXattr (%s,%s): (%d,%s)", p, name, len(result), errstr(err)) }()
 	fi, err := fs.resolve(ctx, p, true)
-	if err != 0 {
-		return
-	}
-	err = fs.m.Access(ctx, fi.inode, mMaskR, fi.attr)
 	if err != 0 {
 		return
 	}
@@ -632,10 +608,6 @@ func (fs *FileSystem) ListXattr(ctx meta.Context, p string) (names []byte, err s
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskR, fi.attr)
-	if err != 0 {
-		return
-	}
 	err = fs.m.ListXattr(ctx, fi.inode, &names)
 	return
 }
@@ -645,10 +617,6 @@ func (fs *FileSystem) RemoveXattr(ctx meta.Context, p string, name string) (err 
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "RemoveXattr (%s,%s): %s", p, name, errstr(err)) }()
 	fi, err := fs.resolve(ctx, p, true)
-	if err != 0 {
-		return
-	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
 	if err != 0 {
 		return
 	}
@@ -689,7 +657,7 @@ func (fs *FileSystem) lookup(ctx meta.Context, parent Ino, name string, inode *I
 		fs.cacheM.Unlock()
 	}
 
-	err = fs.m.Lookup(ctx, parent, name, inode, attr)
+	err = fs.m.Lookup(ctx, parent, name, inode, attr, false)
 	if err == 0 && (fs.conf.DirEntryTimeout > 0 && attr.Typ == meta.TypeDirectory || fs.conf.EntryTimeout > 0 && attr.Typ != meta.TypeDirectory) {
 		fs.cacheM.Lock()
 		if fs.conf.AttrTimeout > 0 {
@@ -713,6 +681,10 @@ func (fs *FileSystem) lookup(ctx meta.Context, parent Ino, name string, inode *I
 }
 
 func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool) (fi *FileStat, err syscall.Errno) {
+	return fs.doResolve(ctx, p, followLastSymlink, 0)
+}
+
+func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, depth int) (fi *FileStat, err syscall.Errno) {
 	var inode Ino
 	var attr = &Attr{}
 
@@ -747,11 +719,11 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 			parent = inode
 			break
 		}
-		if i > 0 {
+		if parent > 1 {
 			if (name == "." || name == "..") && attr.Typ != meta.TypeDirectory {
 				return nil, syscall.ENOTDIR
 			}
-			if err := fs.m.Access(ctx, parent, mMaskX, attr); err != 0 {
+			if err := fs.m.Access(ctx, parent, meta.MODE_MASK_X, attr); err != 0 {
 				return nil, err
 			}
 		}
@@ -768,6 +740,9 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 		}
 		fi = AttrToFileInfo(inode, attr)
 		if (!resolved || followLastSymlink) && fi.IsSymlink() {
+			if depth > 39 {
+				return nil, syscall.ELOOP
+			}
 			var buf []byte
 			err = fs.m.ReadLink(ctx, inode, &buf)
 			if err != 0 {
@@ -778,7 +753,7 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 				return &FileStat{name: target}, syscall.ENOTSUP
 			}
 			target = path.Join(strings.Join(ss[:i], "/"), target)
-			fi, err = fs.resolve(ctx, target, followLastSymlink)
+			fi, err = fs.doResolve(ctx, target, followLastSymlink, depth+1)
 			if err != 0 {
 				return
 			}
@@ -798,7 +773,7 @@ func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool
 	return fi, 0
 }
 
-func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16) (f *File, err syscall.Errno) {
+func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16, umask uint16) (f *File, err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Create").End()
 	l := vfs.NewLogContext(ctx)
 	defer func() { fs.log(l, "Create (%s,%o): %s", p, mode, errstr(err)) }()
@@ -812,11 +787,21 @@ func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16) (f *File, 
 	if err != 0 {
 		return
 	}
-	err = fs.m.Access(ctx, fi.inode, mMaskW, fi.attr)
-	if err != 0 {
-		return
+	err = fs.m.Create(ctx, fi.inode, path.Base(p), mode&07777, umask, syscall.O_EXCL, &inode, attr)
+	if err == syscall.ENOENT && fi.inode != 1 {
+		// dir be moved into trash, try again
+		if fs.conf.DirEntryTimeout > 0 {
+			parent := parentDir(p)
+			if fi, err := fs.resolve(ctx, parentDir(parent), true); err == 0 {
+				fs.invalidateEntry(fi.inode, path.Base(parent))
+			}
+		}
+		if fi2, e := fs.resolve(ctx, parentDir(p), true); e != 0 {
+			return nil, e
+		} else if fi2.inode != fi.inode {
+			err = fs.m.Create(ctx, fi2.inode, path.Base(p), mode&07777, umask, syscall.O_EXCL, &inode, attr)
+		}
 	}
-	err = fs.m.Create(ctx, fi.inode, path.Base(p), mode&07777, 0, syscall.O_EXCL, &inode, attr)
 	if err == 0 {
 		fi = AttrToFileInfo(inode, attr)
 		fi.name = path.Base(p)
@@ -871,9 +856,6 @@ func (f *File) Chmod(ctx meta.Context, mode uint16) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Chmod").End()
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Chmod (%s,%o): %s", f.path, mode, errstr(err)) }()
-	if ctx.Uid() != 0 && ctx.Uid() != f.info.attr.Uid {
-		return syscall.EACCES
-	}
 	var attr = Attr{Mode: mode}
 	err = f.fs.m.SetAttr(ctx, f.inode, meta.SetAttrMode, 0, &attr)
 	f.fs.invalidateAttr(f.inode)
@@ -886,27 +868,9 @@ func (f *File) Chown(ctx meta.Context, uid uint32, gid uint32) (err syscall.Errn
 	defer func() { f.fs.log(l, "Chown (%s,%d,%d): %s", f.path, uid, gid, errstr(err)) }()
 	var flag uint16
 	if uid != uint32(f.info.Uid()) {
-		if ctx.Uid() != 0 {
-			return syscall.EACCES
-		}
 		flag |= meta.SetAttrUID
 	}
 	if gid != uint32(f.info.Gid()) {
-		if ctx.Uid() != 0 {
-			if ctx.Uid() != uint32(f.info.Uid()) {
-				return syscall.EACCES
-			}
-			var found = false
-			for _, g := range ctx.Gids() {
-				if gid == g {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return syscall.EACCES
-			}
-		}
 		flag |= meta.SetAttrGID
 	}
 	var attr = Attr{Uid: uid, Gid: gid}
@@ -929,10 +893,6 @@ func (f *File) Utime(ctx meta.Context, atime, mtime int64) (err syscall.Errno) {
 	}
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Utime (%s,%d,%d): %s", f.path, atime, mtime, errstr(err)) }()
-	err = f.fs.m.Access(ctx, f.inode, mMaskW, f.info.attr)
-	if err != 0 {
-		return err
-	}
 	var attr Attr
 	attr.Atime = atime / 1000
 	attr.Atimensec = uint32(atime%1000) * 1e6
@@ -1110,10 +1070,6 @@ func (f *File) Readdir(ctx meta.Context, count int) (fi []os.FileInfo, err sysca
 	defer f.Unlock()
 	fi = f.dircache
 	if fi == nil {
-		err = f.fs.m.Access(ctx, f.inode, mMaskR, f.info.attr)
-		if err != 0 {
-			return nil, err
-		}
 		var inodes []*meta.Entry
 		err = f.fs.m.Readdir(ctx, f.inode, 1, &inodes)
 		if err != 0 {
@@ -1145,10 +1101,6 @@ func (f *File) ReaddirPlus(ctx meta.Context, offset int) (entries []*meta.Entry,
 	f.Lock()
 	defer f.Unlock()
 	if f.entries == nil {
-		err = f.fs.m.Access(ctx, f.inode, mMaskR|mMaskX, f.info.attr)
-		if err != 0 {
-			return nil, err
-		}
 		var es []*meta.Entry
 		err = f.fs.m.Readdir(ctx, f.inode, 1, &es)
 		if err != 0 {
@@ -1176,6 +1128,6 @@ func (f *File) Summary(ctx meta.Context) (s *meta.Summary, err syscall.Errno) {
 		f.fs.log(l, "Summary (%s): %s (%d,%d,%d,%d)", f.path, errstr(err), s.Length, s.Size, s.Files, s.Dirs)
 	}()
 	s = &meta.Summary{}
-	err = meta.GetSummary(f.fs.m, ctx, f.inode, s, true)
+	err = f.fs.m.GetSummary(ctx, f.inode, s, true, true)
 	return
 }

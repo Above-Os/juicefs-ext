@@ -21,6 +21,7 @@ package meta
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"syscall"
 	"time"
@@ -34,7 +35,7 @@ func (m *dbMeta) Flock(ctx Context, inode Ino, owner_ uint64, ltype uint32, bloc
 		return errno(m.txn(func(s *xorm.Session) error {
 			_, err := s.Delete(&flock{Inode: inode, Owner: owner, Sid: m.sid})
 			return err
-		}))
+		}, inode))
 	}
 	var err syscall.Errno
 	for {
@@ -135,12 +136,12 @@ func (m *dbMeta) Getlk(ctx Context, inode Ino, owner_ uint64, ltype *uint32, sta
 		ls := loadLocks(d)
 		for _, l := range ls {
 			// find conflicted locks
-			if (*ltype == F_WRLCK || l.ltype == F_WRLCK) && *end >= l.start && *start <= l.end {
-				*ltype = l.ltype
-				*start = l.start
-				*end = l.end
+			if (*ltype == F_WRLCK || l.Type == F_WRLCK) && *end >= l.Start && *start <= l.End {
+				*ltype = l.Type
+				*start = l.Start
+				*end = l.End
 				if k.sid == m.sid {
-					*pid = l.pid
+					*pid = l.Pid
 				} else {
 					*pid = 0
 				}
@@ -209,7 +210,7 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 				ls := loadLocks(d)
 				for _, l := range ls {
 					// find conflicted locks
-					if (ltype == F_WRLCK || l.ltype == F_WRLCK) && end >= l.start && start <= l.end {
+					if (ltype == F_WRLCK || l.Type == F_WRLCK) && end >= l.Start && start <= l.End {
 						return syscall.EAGAIN
 					}
 				}
@@ -246,4 +247,30 @@ func (m *dbMeta) Setlk(ctx Context, inode Ino, owner_ uint64, block bool, ltype 
 		}
 	}
 	return err
+}
+
+func (r *dbMeta) ListLocks(ctx context.Context, inode Ino) ([]PLockItem, []FLockItem, error) {
+	var fs []flock
+	if err := r.db.Find(&fs, &flock{Inode: inode}); err != nil {
+		return nil, nil, err
+	}
+
+	flocks := make([]FLockItem, 0, len(fs))
+	for _, f := range fs {
+		flocks = append(flocks, FLockItem{ownerKey{f.Sid, uint64(f.Owner)}, string(f.Ltype)})
+	}
+
+	var ps []plock
+	if err := r.db.Find(&ps, &plock{Inode: inode}); err != nil {
+		return nil, nil, err
+	}
+
+	plocks := make([]PLockItem, 0)
+	for _, p := range ps {
+		ls := loadLocks(p.Records)
+		for _, l := range ls {
+			plocks = append(plocks, PLockItem{ownerKey{p.Sid, uint64(p.Owner)}, l})
+		}
+	}
+	return plocks, flocks, nil
 }

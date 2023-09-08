@@ -24,6 +24,8 @@ package main
 // #include <sys/stat.h>
 // #include <fcntl.h>
 // #include <utime.h>
+// #include <stdlib.h>
+// void jfs_callback(const char *msg);
 import "C"
 import (
 	"bytes"
@@ -83,6 +85,7 @@ const (
 	ENOTDIR   = -0x14
 	EINVAL    = -0x16
 	ENOSPC    = -0x1c
+	EDQUOT    = -0x45
 	EROFS     = -0x1e
 	ENOTEMPTY = -0x27
 	ENODATA   = -0x3d
@@ -120,6 +123,8 @@ func errno(err error) int {
 		return EINVAL
 	case syscall.ENOSPC:
 		return ENOSPC
+	case syscall.EDQUOT:
+		return EDQUOT
 	case syscall.EROFS:
 		return EROFS
 	case syscall.ENOTEMPTY:
@@ -141,6 +146,44 @@ type wrapper struct {
 	user       string
 	superuser  string
 	supergroup string
+}
+
+type logWriter struct {
+	buf chan string
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	select {
+	case w.buf <- string(p):
+		_, _ = os.Stderr.Write(p)
+		return len(p), nil
+	default:
+		return os.Stderr.Write(p)
+	}
+}
+
+func newLogWriter() *logWriter {
+	w := &logWriter{
+		buf: make(chan string, 10),
+	}
+	go func() {
+		for l := range w.buf {
+			cmsg := C.CString(l)
+			C.jfs_callback(cmsg)
+			C.free(unsafe.Pointer(cmsg))
+		}
+	}()
+	return w
+}
+
+//export jfs_set_logger
+func jfs_set_logger(cb unsafe.Pointer) {
+	utils.DisableLogColor()
+	if cb != nil {
+		utils.SetOutput(newLogWriter())
+	} else {
+		utils.SetOutput(os.Stderr)
+	}
 }
 
 func (w *wrapper) withPid(pid int) meta.Context {
@@ -227,40 +270,46 @@ func freeHandle(fd int) {
 }
 
 type javaConf struct {
-	MetaURL         string  `json:"meta"`
-	Bucket          string  `json:"bucket"`
-	ReadOnly        bool    `json:"readOnly"`
-	NoBGJob         bool    `json:"noBGJob"`
-	OpenCache       float64 `json:"openCache"`
-	BackupMeta      int64   `json:"backupMeta"`
-	Heartbeat       int     `json:"heartbeat"`
-	CacheDir        string  `json:"cacheDir"`
-	CacheSize       int64   `json:"cacheSize"`
-	FreeSpace       string  `json:"freeSpace"`
-	AutoCreate      bool    `json:"autoCreate"`
-	CacheFullBlock  bool    `json:"cacheFullBlock"`
-	Writeback       bool    `json:"writeback"`
-	MemorySize      int     `json:"memorySize"`
-	Prefetch        int     `json:"prefetch"`
-	Readahead       int     `json:"readahead"`
-	UploadLimit     int     `json:"uploadLimit"`
-	DownloadLimit   int     `json:"downloadLimit"`
-	MaxUploads      int     `json:"maxUploads"`
-	MaxDeletes      int     `json:"maxDeletes"`
-	IORetries       int     `json:"ioRetries"`
-	GetTimeout      int     `json:"getTimeout"`
-	PutTimeout      int     `json:"putTimeout"`
-	FastResolve     bool    `json:"fastResolve"`
-	AttrTimeout     float64 `json:"attrTimeout"`
-	EntryTimeout    float64 `json:"entryTimeout"`
-	DirEntryTimeout float64 `json:"dirEntryTimeout"`
-	Debug           bool    `json:"debug"`
-	NoUsageReport   bool    `json:"noUsageReport"`
-	AccessLog       string  `json:"accessLog"`
-	PushGateway     string  `json:"pushGateway"`
-	PushInterval    int     `json:"pushInterval"`
-	PushAuth        string  `json:"pushAuth"`
-	PushGraphite    string  `json:"pushGraphite"`
+	MetaURL           string  `json:"meta"`
+	Bucket            string  `json:"bucket"`
+	StorageClass      string  `json:"storageClass"`
+	ReadOnly          bool    `json:"readOnly"`
+	NoSession         bool    `json:"noSession"`
+	NoBGJob           bool    `json:"noBGJob"`
+	OpenCache         float64 `json:"openCache"`
+	BackupMeta        int64   `json:"backupMeta"`
+	Heartbeat         int     `json:"heartbeat"`
+	CacheDir          string  `json:"cacheDir"`
+	CacheSize         int64   `json:"cacheSize"`
+	FreeSpace         string  `json:"freeSpace"`
+	AutoCreate        bool    `json:"autoCreate"`
+	CacheFullBlock    bool    `json:"cacheFullBlock"`
+	CacheChecksum     string  `json:"cacheChecksum"`
+	CacheEviction     string  `json:"cacheEviction"`
+	CacheScanInterval int     `json:"cacheScanInterval"`
+	Writeback         bool    `json:"writeback"`
+	MemorySize        int     `json:"memorySize"`
+	Prefetch          int     `json:"prefetch"`
+	Readahead         int     `json:"readahead"`
+	UploadLimit       int     `json:"uploadLimit"`
+	DownloadLimit     int     `json:"downloadLimit"`
+	MaxUploads        int     `json:"maxUploads"`
+	MaxDeletes        int     `json:"maxDeletes"`
+	SkipDirNlink      int     `json:"skipDirNlink"`
+	IORetries         int     `json:"ioRetries"`
+	GetTimeout        int     `json:"getTimeout"`
+	PutTimeout        int     `json:"putTimeout"`
+	FastResolve       bool    `json:"fastResolve"`
+	AttrTimeout       float64 `json:"attrTimeout"`
+	EntryTimeout      float64 `json:"entryTimeout"`
+	DirEntryTimeout   float64 `json:"dirEntryTimeout"`
+	Debug             bool    `json:"debug"`
+	NoUsageReport     bool    `json:"noUsageReport"`
+	AccessLog         string  `json:"accessLog"`
+	PushGateway       string  `json:"pushGateway"`
+	PushInterval      int     `json:"pushInterval"`
+	PushAuth          string  `json:"pushAuth"`
+	PushGraphite      string  `json:"pushGraphite"`
 }
 
 func getOrCreate(name, user, group, superuser, supergroup string, f func() *fs.FileSystem) uintptr {
@@ -277,6 +326,10 @@ func getOrCreate(name, user, group, superuser, supergroup string, f func() *fs.F
 		jfs = f()
 		if jfs == nil {
 			return 0
+		}
+		switch jfs.Meta().Name() {
+		case "mysql", "postgres", "sqlite3":
+			m.mask = 0x7FFFFFFF // limit generated uid to int32
 		}
 		logger.Infof("JuiceFileSystem created for user:%s group:%s", user, group)
 	}
@@ -379,15 +432,14 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			utils.SetLogLevel(logrus.WarnLevel)
 		}
 
-		metaConf := &meta.Config{
-			Retries:    jConf.IORetries,
-			Strict:     true,
-			MaxDeletes: jConf.MaxDeletes,
-			ReadOnly:   jConf.ReadOnly,
-			NoBGJob:    jConf.NoBGJob,
-			OpenCache:  time.Duration(jConf.OpenCache * 1e9),
-			Heartbeat:  time.Second * time.Duration(jConf.Heartbeat),
-		}
+		metaConf := meta.DefaultConf()
+		metaConf.Retries = jConf.IORetries
+		metaConf.MaxDeletes = jConf.MaxDeletes
+		metaConf.SkipDirNlink = jConf.SkipDirNlink
+		metaConf.ReadOnly = jConf.ReadOnly
+		metaConf.NoBGJob = jConf.NoBGJob || jConf.NoSession
+		metaConf.OpenCache = time.Duration(jConf.OpenCache * 1e9)
+		metaConf.Heartbeat = time.Second * time.Duration(jConf.Heartbeat)
 		m := meta.NewClient(jConf.MetaURL, metaConf)
 		format, err := m.Load(true)
 		if err != nil {
@@ -422,17 +474,13 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			go metric.UpdateMetrics(m, registerer)
 		}
 
-		if jConf.Bucket != "" {
-			format.Bucket = jConf.Bucket
-		}
-		blob, err := cmd.NewReloadableStorage(format, func() (*meta.Format, error) {
-			format, err := m.Load(true)
-			if err == nil {
-				if jConf.Bucket != "" {
-					format.Bucket = jConf.Bucket
-				}
+		blob, err := cmd.NewReloadableStorage(format, m, func(f *meta.Format) {
+			if jConf.Bucket != "" {
+				format.Bucket = jConf.Bucket
 			}
-			return format, err
+			if jConf.StorageClass != "" {
+				format.StorageClass = jConf.StorageClass
+			}
 		})
 		if err != nil {
 			logger.Errorf("object storage: %s", err)
@@ -445,33 +493,36 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			freeSpaceRatio, _ = strconv.ParseFloat(jConf.FreeSpace, 64)
 		}
 		chunkConf := chunk.Config{
-			BlockSize:      format.BlockSize * 1024,
-			Compress:       format.Compression,
-			CacheDir:       jConf.CacheDir,
-			CacheMode:      0644, // all user can read cache
-			CacheSize:      jConf.CacheSize,
-			FreeSpace:      float32(freeSpaceRatio),
-			AutoCreate:     jConf.AutoCreate,
-			CacheFullBlock: jConf.CacheFullBlock,
-			MaxUpload:      jConf.MaxUploads,
-			MaxRetries:     jConf.IORetries,
-			UploadLimit:    int64(jConf.UploadLimit) * 1e6 / 8,
-			DownloadLimit:  int64(jConf.DownloadLimit) * 1e6 / 8,
-			Prefetch:       jConf.Prefetch,
-			Writeback:      jConf.Writeback,
-			HashPrefix:     format.HashPrefix,
-			GetTimeout:     time.Second * time.Duration(jConf.GetTimeout),
-			PutTimeout:     time.Second * time.Duration(jConf.PutTimeout),
-			BufferSize:     jConf.MemorySize << 20,
-			Readahead:      jConf.Readahead << 20,
+			BlockSize:         format.BlockSize * 1024,
+			Compress:          format.Compression,
+			CacheDir:          jConf.CacheDir,
+			CacheMode:         0644, // all user can read cache
+			CacheSize:         jConf.CacheSize,
+			FreeSpace:         float32(freeSpaceRatio),
+			AutoCreate:        jConf.AutoCreate,
+			CacheFullBlock:    jConf.CacheFullBlock,
+			CacheChecksum:     jConf.CacheChecksum,
+			CacheEviction:     jConf.CacheEviction,
+			CacheScanInterval: time.Second * time.Duration(jConf.CacheScanInterval),
+			MaxUpload:         jConf.MaxUploads,
+			MaxRetries:        jConf.IORetries,
+			UploadLimit:       int64(jConf.UploadLimit) * 1e6 / 8,
+			DownloadLimit:     int64(jConf.DownloadLimit) * 1e6 / 8,
+			Prefetch:          jConf.Prefetch,
+			Writeback:         jConf.Writeback,
+			HashPrefix:        format.HashPrefix,
+			GetTimeout:        time.Second * time.Duration(jConf.GetTimeout),
+			PutTimeout:        time.Second * time.Duration(jConf.PutTimeout),
+			BufferSize:        jConf.MemorySize << 20,
+			Readahead:         jConf.Readahead << 20,
 		}
-		if chunkConf.CacheDir != "memory" {
-			ds := utils.SplitDir(chunkConf.CacheDir)
-			for i := range ds {
-				ds[i] = filepath.Join(ds[i], format.UUID)
-			}
-			chunkConf.CacheDir = strings.Join(ds, string(os.PathListSeparator))
+		if chunkConf.UploadLimit == 0 {
+			chunkConf.UploadLimit = format.UploadLimit * 1e6 / 8
 		}
+		if chunkConf.DownloadLimit == 0 {
+			chunkConf.DownloadLimit = format.DownloadLimit * 1e6 / 8
+		}
+		chunkConf.SelfCheck(format.UUID)
 		store := chunk.NewCachedStore(blob, chunkConf, registerer)
 		m.OnMsg(meta.DeleteSlice, func(args ...interface{}) error {
 			id := args[0].(uint64)
@@ -483,15 +534,24 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			id := args[1].(uint64)
 			return vfs.Compact(chunkConf, store, slices, id)
 		})
-		err = m.NewSession()
+		err = m.NewSession(!jConf.NoSession)
 		if err != nil {
 			logger.Errorf("new session: %s", err)
 			return nil
 		}
+		m.OnReload(func(fmt *meta.Format) {
+			if jConf.UploadLimit > 0 {
+				fmt.UploadLimit = int64(jConf.UploadLimit)
+			}
+			if jConf.DownloadLimit > 0 {
+				fmt.DownloadLimit = int64(jConf.DownloadLimit)
+			}
+			store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+		})
 
 		conf := &vfs.Config{
 			Meta:            metaConf,
-			Format:          format,
+			Format:          *format,
 			Chunk:           &chunkConf,
 			AttrTimeout:     time.Millisecond * time.Duration(jConf.AttrTimeout*1000),
 			EntryTimeout:    time.Millisecond * time.Duration(jConf.EntryTimeout*1000),
@@ -500,10 +560,10 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			FastResolve:     jConf.FastResolve,
 			BackupMeta:      time.Second * time.Duration(jConf.BackupMeta),
 		}
-		if !jConf.ReadOnly && !jConf.NoBGJob && conf.BackupMeta > 0 {
+		if !jConf.ReadOnly && !jConf.NoSession && !jConf.NoBGJob && conf.BackupMeta > 0 {
 			go vfs.Backup(m, blob, conf.BackupMeta)
 		}
-		if !jConf.NoUsageReport {
+		if !jConf.NoUsageReport && !jConf.NoSession {
 			go usage.ReportUsage(m, "java-sdk "+version.Version())
 		}
 		jfs, err := fs.NewFileSystem(conf, m, store)
@@ -640,7 +700,7 @@ func jfs_term(pid int, h uintptr) int {
 }
 
 //export jfs_open
-func jfs_open(pid int, h uintptr, cpath *C.char, flags int) int {
+func jfs_open(pid int, h uintptr, cpath *C.char, lenPtr uintptr, flags int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -653,6 +713,11 @@ func jfs_open(pid int, h uintptr, cpath *C.char, flags int) int {
 	st, _ := f.Stat()
 	if st.IsDir() {
 		return ENOENT
+	}
+	if lenPtr != 0 {
+		buf := toBuf(lenPtr, 8)
+		wb := utils.NewNativeBuffer(buf)
+		wb.Put64(uint64(st.Size()))
 	}
 	return nextFileHandle(f, w)
 }
@@ -667,13 +732,13 @@ func jfs_access(pid int, h uintptr, cpath *C.char, flags int) int {
 }
 
 //export jfs_create
-func jfs_create(pid int, h uintptr, cpath *C.char, mode uint16) int {
+func jfs_create(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
 	}
 	path := C.GoString(cpath)
-	f, err := w.Create(w.withPid(pid), path, mode)
+	f, err := w.Create(w.withPid(pid), path, mode, umask)
 	if err != 0 {
 		return errno(err)
 	}
@@ -685,12 +750,12 @@ func jfs_create(pid int, h uintptr, cpath *C.char, mode uint16) int {
 }
 
 //export jfs_mkdir
-func jfs_mkdir(pid int, h uintptr, cpath *C.char, mode C.mode_t) int {
+func jfs_mkdir(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
 	}
-	err := errno(w.Mkdir(w.withPid(pid), C.GoString(cpath), uint16(mode)))
+	err := errno(w.Mkdir(w.withPid(pid), C.GoString(cpath), mode, umask))
 	if err == 0 && w.ctx.Uid() == 0 && w.user != w.superuser {
 		// belongs to supergroup
 		_ = setOwner(w, w.withPid(pid), C.GoString(cpath), w.user, "")
@@ -1028,7 +1093,7 @@ func jfs_concat(pid int, h uintptr, _dst *C.char, buf uintptr, bufsize int) int 
 	var tmp string
 	if len(srcs) > 1 {
 		tmp = filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".merging")
-		fi, err := w.Create(ctx, tmp, 0644)
+		fi, err := w.Create(ctx, tmp, 0666, 022)
 		if err != 0 {
 			return errno(err)
 		}

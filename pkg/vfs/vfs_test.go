@@ -17,6 +17,8 @@
 package vfs
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
@@ -38,19 +40,25 @@ import (
 
 func createTestVFS() (*VFS, object.ObjectStorage) {
 	mp := "/jfs"
+<<<<<<< HEAD
 	metaConf := &meta.Config{
 		Retries:    10,
 		Strict:     true,
 		MaxDeletes: 2,
 		MountPoint: mp,
 	}
+=======
+	metaConf := meta.DefaultConf()
+	metaConf.MountPoint = mp
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
 	m := meta.NewClient("memkv://", metaConf)
-	format := meta.Format{
+	format := &meta.Format{
 		Name:        "test",
 		UUID:        uuid.New().String(),
 		Storage:     "mem",
 		BlockSize:   4096,
 		Compression: "lz4",
+		DirStats:    true,
 	}
 	err := m.Init(format, true)
 	if err != nil {
@@ -58,7 +66,7 @@ func createTestVFS() (*VFS, object.ObjectStorage) {
 	}
 	conf := &Config{
 		Meta:    metaConf,
-		Format:  &format,
+		Format:  *format,
 		Version: "Juicefs",
 		Chunk: &chunk.Config{
 			BlockSize:  format.BlockSize * 1024,
@@ -79,7 +87,7 @@ func createTestVFS() (*VFS, object.ObjectStorage) {
 
 func TestVFSBasic(t *testing.T) {
 	v, _ := createTestVFS()
-	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2}))
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
 
 	if st, e := v.StatFS(ctx, 1); e != 0 {
 		t.Fatalf("statfs 1: %s", e)
@@ -113,9 +121,9 @@ func TestVFSBasic(t *testing.T) {
 	if _, e := v.SetAttr(ctx, fe.Inode, meta.SetAttrMtimeNow|meta.SetAttrAtimeNow, 0, 0, 0, 0, 0, 0, 0, 0, 0); e != 0 {
 		t.Fatalf("setattr d1/f2 mtimeNow: %s", e)
 	}
-	if fe2, e := v.SetAttr(ctx, fe.Inode, meta.SetAttrMode|meta.SetAttrUID|meta.SetAttrGID|meta.SetAttrAtime|meta.SetAttrMtime|meta.SetAttrSize, 0, 0755, 2, 3, 1234, 1234, 5678, 5678, 1024); e != 0 {
+	if fe2, e := v.SetAttr(ctx, fe.Inode, meta.SetAttrMode|meta.SetAttrUID|meta.SetAttrGID|meta.SetAttrAtime|meta.SetAttrMtime|meta.SetAttrSize, 0, 0755, 1, 3, 1234, 1234, 5678, 5678, 1024); e != 0 {
 		t.Fatalf("setattr d1/f1: %s %d %d", e, fe2.Attr.Gid, fe2.Attr.Length)
-	} else if fe2.Attr.Mode != 0755 || fe2.Attr.Uid != 2 || fe2.Attr.Gid != 3 || fe2.Attr.Atime != 1234 || fe2.Attr.Atimensec != 5678 || fe2.Attr.Mtime != 1234 || fe2.Attr.Mtimensec != 5678 || fe2.Attr.Length != 1024 {
+	} else if fe2.Attr.Mode != 0755 || fe2.Attr.Uid != 1 || fe2.Attr.Gid != 3 || fe2.Attr.Atime != 1234 || fe2.Attr.Atimensec != 5678 || fe2.Attr.Mtime != 1234 || fe2.Attr.Mtimensec != 5678 || fe2.Attr.Length != 1024 {
 		t.Fatalf("setattr d1/f1: %+v", fe2.Attr)
 	}
 	if e := v.Access(ctx, fe.Inode, unix.X_OK); e != 0 {
@@ -232,9 +240,18 @@ func TestVFSIO(t *testing.T) {
 
 	// edge cases
 	_, fh2, _ := v.Open(ctx, fe.Inode, syscall.O_RDONLY)
+	_, fh3, _ := v.Open(ctx, fe.Inode, syscall.O_WRONLY)
+	wHandle := v.findHandle(fe.Inode, fh3)
+	if wHandle == nil {
+		t.Fatalf("failed to find O_WRONLY handle")
+	}
+	wHandle.reader = nil
 	// read
 	if _, e = v.Read(ctx, fe.Inode, nil, 0, 0); e != syscall.EBADF {
 		t.Fatalf("read bad fd: %s", e)
+	}
+	if _, e = v.Read(ctx, fe.Inode, make([]byte, 1024), 0, fh3); e != syscall.EBADF {
+		t.Fatalf("read write-only fd: %s", e)
 	}
 	if _, e = v.Read(ctx, fe.Inode, nil, 1<<60, fh2); e != syscall.EFBIG {
 		t.Fatalf("read off too big: %s", e)
@@ -246,8 +263,8 @@ func TestVFSIO(t *testing.T) {
 	if e = v.Write(ctx, fe.Inode, nil, 1<<60, fh2); e != syscall.EFBIG {
 		t.Fatalf("write off too big: %s", e)
 	}
-	if e = v.Write(ctx, fe.Inode, make([]byte, 1024), 0, fh2); e != syscall.EACCES {
-		t.Fatalf("write off too big: %s", e)
+	if e = v.Write(ctx, fe.Inode, make([]byte, 1024), 0, fh2); e != syscall.EBADF {
+		t.Fatalf("write read-only fd: %s", e)
 	}
 	// truncate
 	if e = v.Truncate(ctx, fe.Inode, -1, 0, &meta.Attr{}); e != syscall.EINVAL {
@@ -269,8 +286,8 @@ func TestVFSIO(t *testing.T) {
 	if e = v.Fallocate(ctx, fe.Inode, 0, 1<<60, 1<<60, fh); e != syscall.EFBIG {
 		t.Fatalf("fallocate invalid off,length: %s", e)
 	}
-	if e = v.Fallocate(ctx, fe.Inode, 0, 1<<10, 1<<20, fh2); e != syscall.EACCES {
-		t.Fatalf("fallocate invalid off,length: %s", e)
+	if e = v.Fallocate(ctx, fe.Inode, 0, 1<<10, 1<<20, fh2); e != syscall.EBADF {
+		t.Fatalf("fallocate read-only fd: %s", e)
 	}
 
 	// copy file range
@@ -589,7 +606,7 @@ func TestInternalFile(t *testing.T) {
 	v, _ := createTestVFS()
 	ctx := NewLogContext(meta.Background)
 	// list internal files
-	fh, _ := v.Opendir(ctx, 1)
+	fh, _ := v.Opendir(ctx, 1, 0)
 	entries, _, e := v.Readdir(ctx, 1, 1024, 0, fh, true)
 	if e != 0 {
 		t.Fatalf("readdir 1: %s", e)
@@ -703,7 +720,7 @@ func TestInternalFile(t *testing.T) {
 	readControl := func(resp []byte, off *uint64) (int, syscall.Errno) {
 		for {
 			if n, errno := v.Read(ctx, fe.Inode, resp, *off, fh); n == 0 {
-				time.Sleep(time.Millisecond * 300)
+				time.Sleep(time.Millisecond * 200)
 			} else if n%17 == 0 {
 				*off += uint64(n)
 				continue
@@ -713,6 +730,38 @@ func TestInternalFile(t *testing.T) {
 				return 1, errno
 			} else {
 				return n, errno
+			}
+		}
+	}
+
+	readData := func(resp []byte, fileOff *uint64) ([]byte, syscall.Errno) {
+		var off uint64
+		for {
+			n, errno := v.Read(ctx, fe.Inode, resp, *fileOff, fh)
+			if errno != 0 {
+				return nil, errno
+			}
+			if n == 0 {
+				time.Sleep(time.Millisecond * 200)
+				continue
+			}
+			*fileOff += uint64(n)
+			for {
+				if n == 1 {
+					return nil, syscall.Errno(resp[off])
+				} else if off+17 <= uint64(n) && resp[off] == meta.CPROGRESS {
+					off += 17
+				} else if off+5 < uint64(n) && resp[off] == meta.CDATA {
+					size := binary.BigEndian.Uint32(resp[off+1 : off+5])
+					if off+5+uint64(size) > uint64(n) {
+						logger.Errorf("Bad response off %d n %d: %v", off, n, resp)
+						return nil, syscall.EIO
+					}
+					return resp[off+5 : off+5+uint64(size)], 0
+				} else {
+					logger.Errorf("Bad response off %d n %d: %v", off, n, resp)
+					return nil, syscall.EIO
+				}
 			}
 		}
 	}
@@ -737,24 +786,48 @@ func TestInternalFile(t *testing.T) {
 	} else {
 		off += uint64(n)
 	}
-	// info
+	// legacy info
 	buf = make([]byte, 4+4+8)
 	w = utils.FromBuffer(buf)
-	w.Put32(meta.Info)
+	w.Put32(meta.LegacyInfo)
 	w.Put32(8)
 	w.Put64(1)
 	if e := v.Write(ctx, fe.Inode, w.Bytes(), off, fh); e != 0 {
-		t.Fatalf("write info: %s", e)
+		t.Fatalf("write legacy info: %s", e)
 	}
 	off += uint64(len(buf))
 	buf = make([]byte, 1024*10)
 	if n, e = readControl(buf, &off); e != 0 {
 		t.Fatalf("read result: %s %d", e, n)
 	} else if !strings.Contains(string(buf[:n]), "dirs:") {
-		t.Fatalf("info result: %s", string(buf[:n]))
+		t.Fatalf("legacy info result: %s", string(buf[:n]))
 	} else {
 		off += uint64(n)
 	}
+	// info v2
+	buf = make([]byte, 4+4+8)
+	w = utils.FromBuffer(buf)
+	w.Put32(meta.InfoV2)
+	w.Put32(8)
+	w.Put64(1)
+	if e := v.Write(ctx, fe.Inode, w.Bytes(), off, fh); e != 0 {
+		t.Fatalf("write info v2: %s", e)
+	}
+	off += uint64(len(buf))
+	buf = make([]byte, 1024*10)
+	data, e := readData(buf, &off)
+	if e != 0 {
+		t.Fatalf("read progress bar: %s %d", e, n)
+	}
+
+	var infoResp InfoResponse
+	if e := json.Unmarshal(data, &infoResp); e != nil {
+		t.Fatalf("unmarshal info v2: %s", e)
+	}
+	if infoResp.Failed && infoResp.Reason != "" {
+		t.Fatalf("info v2 result: %s", infoResp.Reason)
+	}
+
 	// fill
 	buf = make([]byte, 4+4+8+1+1+2+1)
 	w = utils.FromBuffer(buf)

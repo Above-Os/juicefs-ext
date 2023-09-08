@@ -17,8 +17,8 @@
 package cmd
 
 import (
+	"crypto/rand"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +113,12 @@ type benchmark struct {
 	tmpdir     string
 }
 
+func randRead(buf []byte) {
+	if _, err := rand.Read(buf); err != nil {
+		logger.Fatalf("Generate random content: %s", err)
+	}
+}
+
 func (bc *benchCase) writeFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
 		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
@@ -121,7 +127,7 @@ func (bc *benchCase) writeFiles(index int) {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
 		}
 		buf := make([]byte, bc.bsize)
-		_, _ = rand.Read(buf)
+		randRead(buf)
 		for j := 0; j < bc.bcount; j++ {
 			if _, err = fp.Write(buf); err != nil {
 				logger.Fatalf("Failed to write file %s: %s", fname, err)
@@ -337,17 +343,11 @@ func bench(ctx *cli.Context) error {
 
 	/* --- Prepare --- */
 	if _, err := os.Stat(bm.tmpdir); os.IsNotExist(err) {
-		if err = os.MkdirAll(bm.tmpdir, 0755); err != nil {
+		if err = os.MkdirAll(bm.tmpdir, 0777); err != nil {
 			logger.Fatalf("Failed to create %s: %s", bm.tmpdir, err)
 		}
 	}
-	var statsPath string
-	for mp := filepath.Dir(bm.tmpdir); mp != "/"; mp = filepath.Dir(mp) {
-		if _, err := os.Stat(filepath.Join(mp, ".stats")); err == nil {
-			statsPath = filepath.Join(mp, ".stats")
-			break
-		}
-	}
+	mp, _ := findMountpoint(bm.tmpdir)
 	dropCaches := func() {
 		if os.Getenv("SKIP_DROP_CACHES") != "true" {
 			if err := exec.Command(purgeArgs[0], purgeArgs[1:]...).Run(); err != nil {
@@ -362,7 +362,7 @@ func bench(ctx *cli.Context) error {
 	}
 	dropCaches()
 	bm.colorful = utils.SupportANSIColor(os.Stdout.Fd())
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	if b := bm.big; b != nil {
 		total := int64(bm.threads * b.fcount * b.bcount)
 		b.wbar = progress.AddCountBar("Write big blocks", total)
@@ -377,13 +377,14 @@ func bench(ctx *cli.Context) error {
 
 	/* --- Run Benchmark --- */
 	var stats map[string]float64
-	if statsPath != "" {
-		stats = readStats(statsPath)
+	if mp != "" {
+		stats = readStats(mp)
 	}
 	var result [][]string
 	result = append(result, []string{"ITEM", "VALUE", "COST"})
 	if b := bm.big; b != nil {
 		cost := b.run("write")
+		b.wbar.Done()
 		line := make([]string, 3)
 		line[0] = "Write big file"
 		line[1], line[2] = bm.colorize("bigwr", float64((b.fsize>>20)*b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
@@ -393,6 +394,7 @@ func bench(ctx *cli.Context) error {
 		dropCaches()
 
 		cost = b.run("read")
+		b.rbar.Done()
 		line = make([]string, 3)
 		line[0] = "Read big file"
 		line[1], line[2] = bm.colorize("bigrd", float64((b.fsize>>20)*b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
@@ -402,6 +404,7 @@ func bench(ctx *cli.Context) error {
 	}
 	if s := bm.small; s != nil {
 		cost := s.run("write")
+		s.wbar.Done()
 		line := make([]string, 3)
 		line[0] = "Write small file"
 		line[1], line[2] = bm.colorize("smallwr", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -411,6 +414,7 @@ func bench(ctx *cli.Context) error {
 		dropCaches()
 
 		cost = s.run("read")
+		s.rbar.Done()
 		line = make([]string, 3)
 		line[0] = "Read small file"
 		line[1], line[2] = bm.colorize("smallrd", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -420,6 +424,7 @@ func bench(ctx *cli.Context) error {
 		dropCaches()
 
 		cost = s.run("stat")
+		s.sbar.Done()
 		line = make([]string, 3)
 		line[0] = "Stat file"
 		line[1], line[2] = bm.colorize("stat", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -439,7 +444,7 @@ func bench(ctx *cli.Context) error {
 	fmt.Printf("BlockSize: %d MiB, BigFileSize: %d MiB, SmallFileSize: %d KiB, SmallFileCount: %d, NumThreads: %d\n",
 		ctx.Uint("block-size"), ctx.Uint("big-file-size"), ctx.Uint("small-file-size"), ctx.Uint("small-file-count"), ctx.Uint("threads"))
 	if stats != nil {
-		stats2 := readStats(statsPath)
+		stats2 := readStats(mp)
 		diff := func(item string) float64 {
 			return stats2["juicefs_"+item] - stats["juicefs_"+item]
 		}

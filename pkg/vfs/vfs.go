@@ -19,6 +19,7 @@ package vfs
 import (
 	"encoding/json"
 	"runtime"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -40,18 +41,34 @@ const (
 	maxFileSize = meta.ChunkSize << 31
 )
 
+type Port struct {
+	PrometheusAgent string `json:",omitempty"`
+	DebugAgent      string `json:",omitempty"`
+	ConsulAddr      string `json:",omitempty"`
+	PyroscopeAddr   string `json:",omitempty"`
+}
+
 type Config struct {
-	Meta            *meta.Config
-	Format          *meta.Format
-	Chunk           *chunk.Config
-	Version         string
-	AttrTimeout     time.Duration
-	DirEntryTimeout time.Duration
-	EntryTimeout    time.Duration
-	BackupMeta      time.Duration
-	FastResolve     bool   `json:",omitempty"`
-	AccessLog       string `json:",omitempty"`
-	HideInternal    bool
+	Meta                 *meta.Config
+	Format               meta.Format
+	Chunk                *chunk.Config
+	Port                 *Port
+	Version              string
+	AttrTimeout          time.Duration
+	DirEntryTimeout      time.Duration
+	EntryTimeout         time.Duration
+	BackupMeta           time.Duration
+	FastResolve          bool   `json:",omitempty"`
+	AccessLog            string `json:",omitempty"`
+	PrefixInternal       bool
+	HideInternal         bool
+	RootSquash           *RootSquash `json:",omitempty"`
+	NonDefaultPermission bool        `json:",omitempty"`
+}
+
+type RootSquash struct {
+	Uid uint32
+	Gid uint32
 }
 
 var (
@@ -70,7 +87,7 @@ var (
 func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
 	var inode Ino
 	var attr = &Attr{}
-	if parent == rootID || name == ".control" {
+	if parent == rootID || name == internalNodes[0].name { // 0 is the control file
 		n := getInternalNodeByName(name)
 		if n != nil {
 			entry = &meta.Entry{Inode: n.inode, Attr: n.attr}
@@ -90,7 +107,7 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 		err = syscall.ENAMETOOLONG
 		return
 	}
-	err = v.Meta.Lookup(ctx, parent, name, &inode, attr)
+	err = v.Meta.Lookup(ctx, parent, name, &inode, attr, true)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
 	}
@@ -279,8 +296,22 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 	return
 }
 
-func (v *VFS) Opendir(ctx Context, ino Ino) (fh uint64, err syscall.Errno) {
+func (v *VFS) Opendir(ctx Context, ino Ino, flags uint32) (fh uint64, err syscall.Errno) {
 	defer func() { logit(ctx, "opendir (%d): %s [fh:%d]", ino, strerr(err), fh) }()
+	if ctx.CheckPermission() {
+		var mmask uint8 = 0
+		switch flags & (syscall.O_RDONLY | syscall.O_WRONLY | syscall.O_RDWR) {
+		case syscall.O_RDONLY:
+			mmask = MODE_MASK_R
+		case syscall.O_WRONLY:
+			mmask = MODE_MASK_W
+		case syscall.O_RDWR:
+			mmask = MODE_MASK_R | MODE_MASK_W
+		}
+		if err = v.Meta.Access(ctx, ino, mmask, nil); err != 0 {
+			return
+		}
+	}
 	fh = v.newHandle(ino).fh
 	return
 }
@@ -398,6 +429,10 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 		case statsInode:
 			h.data = collectMetrics(v.registry)
 		case configInode:
+			v.Conf.Format = v.Meta.GetFormat()
+			if v.UpdateFormat != nil {
+				v.UpdateFormat(&v.Conf.Format)
+			}
 			v.Conf.Format.RemoveSecret()
 			h.data, _ = json.MarshalIndent(v.Conf, "", " ")
 			entry.Attr.Length = uint64(len(h.data))
@@ -414,7 +449,7 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	return
 }
 
-func (v *VFS) Truncate(ctx Context, ino Ino, size int64, opened uint8, attr *Attr) (err syscall.Errno) {
+func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
@@ -429,6 +464,7 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, opened uint8, attr *Att
 		return
 	}
 	hs := v.findAllHandles(ino)
+	sort.Slice(hs, func(i, j int) bool { return hs[i].fh < hs[j].fh })
 	for _, h := range hs {
 		if !h.Wlock(ctx) {
 			err = syscall.EINTR
@@ -437,13 +473,26 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, opened uint8, attr *Att
 		defer func(h *handle) { h.Wunlock() }(h)
 	}
 	_ = v.writer.Flush(ctx, ino)
-	err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr)
+	if fh == 0 {
+		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, false)
+	} else {
+		h := v.findHandle(ino, fh)
+		if h == nil {
+			err = syscall.EBADF
+			return
+		}
+		if h.writer == nil {
+			err = syscall.EACCES
+			return
+		}
+		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, true)
+	}
 	if err == 0 {
 		v.writer.Truncate(ino, uint64(size))
 		v.reader.Truncate(ino, uint64(size))
 		v.invalidateLength(ino)
 	}
-	return 0
+	return err
 }
 
 func (v *VFS) ReleaseHandler(ino Ino, fh uint64) {
@@ -452,7 +501,7 @@ func (v *VFS) ReleaseHandler(ino Ino, fh uint64) {
 
 func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	var err syscall.Errno
-	defer func() { logit(ctx, "release (%d): %s", ino, strerr(err)) }()
+	defer func() { logit(ctx, "release (%d,%d): %s", ino, fh, strerr(err)) }()
 	if IsSpecialNode(ino) {
 		if ino == logInode {
 			closeAccessLog(fh)
@@ -536,7 +585,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		return
 	}
 	if h.reader == nil {
-		err = syscall.EACCES
+		err = syscall.EBADF
 		return
 	}
 	if !h.Rlock(ctx) {
@@ -597,7 +646,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	}
 
 	if h.writer == nil {
-		err = syscall.EACCES
+		err = syscall.EBADF
 		return
 	}
 
@@ -640,7 +689,7 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, length int64, fh 
 		return
 	}
 	if h.writer == nil {
-		err = syscall.EACCES
+		err = syscall.EBADF
 		return
 	}
 	if !h.Wlock(ctx) {
@@ -729,7 +778,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 		fh = v.getControlHandle(ctx.Pid())
 		defer v.releaseControlHandle(ctx.Pid())
 	}
-	defer func() { logit(ctx, "flush (%d,%d): %s", ino, fh, strerr(err)) }()
+	defer func() { logit(ctx, "flush (%d,%d,%016X): %s", ino, fh, lockOwner, strerr(err)) }()
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		err = syscall.EBADF
@@ -832,7 +881,6 @@ func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags ui
 
 func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []byte, err syscall.Errno) {
 	defer func() { logit(ctx, "getxattr (%d,%s,%d): %s (%d)", ino, name, size, strerr(err), len(value)) }()
-
 	if IsSpecialNode(ino) {
 		err = meta.ENOATTR
 		return
@@ -905,6 +953,7 @@ type VFS struct {
 	Meta            meta.Meta
 	Store           chunk.ChunkStore
 	InvalidateEntry func(parent meta.Ino, name string) syscall.Errno
+	UpdateFormat    func(*meta.Format)
 	reader          DataReader
 	writer          DataWriter
 
@@ -918,6 +967,7 @@ type VFS struct {
 	handlersGause  prometheus.GaugeFunc
 	usedBufferSize prometheus.GaugeFunc
 	storeCacheSize prometheus.GaugeFunc
+	readBufferUsed prometheus.GaugeFunc
 	registry       *prometheus.Registry
 }
 
@@ -944,9 +994,15 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	if conf.Meta.Subdir != "" { // don't show trash directory
 		internalNodes = internalNodes[:len(internalNodes)-1]
 	}
+	if conf.PrefixInternal {
+		for _, n := range internalNodes {
+			n.name = ".jfs" + n.name
+		}
+		meta.TrashName = ".jfs" + meta.TrashName
+	}
 
 	go v.cleanupModified()
-	initVFSMetrics(v, writer, registerer)
+	initVFSMetrics(v, writer, reader, registerer)
 	return v
 }
 
@@ -983,7 +1039,7 @@ func (v *VFS) cleanupModified() {
 	}
 }
 
-func initVFSMetrics(v *VFS, writer DataWriter, registerer prometheus.Registerer) {
+func initVFSMetrics(v *VFS, writer DataWriter, reader DataReader, registerer prometheus.Registerer) {
 	if registerer == nil {
 		return
 	}
@@ -1013,9 +1069,19 @@ func initVFSMetrics(v *VFS, writer DataWriter, registerer prometheus.Registerer)
 		}
 		return 0.0
 	})
+	v.readBufferUsed = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "used_read_buffer_size_bytes",
+		Help: "size of currently used buffer for read",
+	}, func() float64 {
+		if dr, ok := reader.(*dataReader); ok {
+			return float64(dr.readBufferUsed())
+		}
+		return 0.0
+	})
 	_ = registerer.Register(v.handlersGause)
 	_ = registerer.Register(v.usedBufferSize)
 	_ = registerer.Register(v.storeCacheSize)
+	_ = registerer.Register(v.readBufferUsed)
 }
 
 func InitMetrics(registerer prometheus.Registerer) {

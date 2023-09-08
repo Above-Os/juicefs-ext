@@ -24,7 +24,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
@@ -61,11 +60,11 @@ func (t *tikv) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
 func (t *tikv) Put(key string, in io.Reader) error {
-	d, err := ioutil.ReadAll(in)
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -82,6 +81,7 @@ func (t *tikv) Head(key string) (Object, error) {
 		int64(len(data)),
 		time.Now(),
 		strings.HasSuffix(key, "/"),
+		"",
 	}, err
 }
 
@@ -89,7 +89,10 @@ func (t *tikv) Delete(key string) error {
 	return t.c.Delete(context.TODO(), []byte(key))
 }
 
-func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
+func (t *tikv) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
+	if delimiter != "" {
+		return nil, notSupported
+	}
 	if marker == "" {
 		marker = prefix
 	}
@@ -101,11 +104,11 @@ func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	var objs []Object = make([]Object, len(keys))
+	var objs = make([]Object, len(keys))
 	mtime := time.Now()
 	for i, k := range keys {
 		// FIXME: mtime
-		objs[i] = &obj{string(k), int64(len(vs[i])), mtime, strings.HasSuffix(string(k), "/")}
+		objs[i] = &obj{string(k), int64(len(vs[i])), mtime, strings.HasSuffix(string(k), "/"), ""}
 	}
 	return objs, nil
 }

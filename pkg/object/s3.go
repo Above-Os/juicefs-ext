@@ -23,12 +23,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -42,6 +43,7 @@ import (
 )
 
 const awsDefaultRegion = "us-east-1"
+const s3RequestIDKey = "X-Amz-Request-Id"
 
 var disableSha256Func = func(r *request.Request) {
 	if op := r.Operation.Name; r.ClientInfo.ServiceID != "S3" || !(op == "PutObject" || op == "UploadPart") {
@@ -55,6 +57,7 @@ var disableSha256Func = func(r *request.Request) {
 
 type s3client struct {
 	bucket string
+	sc     string
 	s3     *s3.S3
 	ses    *session.Session
 }
@@ -63,13 +66,23 @@ func (s *s3client) String() string {
 	return fmt.Sprintf("s3://%s/", s.bucket)
 }
 
+func (s *s3client) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              5 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
 func isExists(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, s3.ErrCodeBucketAlreadyExists) || strings.Contains(msg, s3.ErrCodeBucketAlreadyOwnedByYou)
 }
 
 func (s *s3client) Create() error {
-	if _, err := s.List("", "", 1); err == nil {
+	if _, err := s.List("", "", "", 1, true); err == nil {
 		return nil
 	}
 	_, err := s.s3.CreateBucket(&s3.CreateBucketInput{Bucket: &s.bucket})
@@ -91,11 +104,18 @@ func (s *s3client) Head(key string) (Object, error) {
 		}
 		return nil, err
 	}
+	var sc string
+	if r.StorageClass != nil {
+		sc = *r.StorageClass
+	} else {
+		sc = "STANDARD"
+	}
 	return &obj{
 		key,
 		*r.ContentLength,
 		*r.LastModified,
 		strings.HasSuffix(key, "/"),
+		sc,
 	}, nil
 }
 
@@ -110,7 +130,9 @@ func (s *s3client) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		}
 		params.Range = &r
 	}
-	resp, err := s.s3.GetObject(params)
+	var reqID string
+	resp, err := s.s3.GetObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	ReqIDCache.put(key, reqID)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +150,7 @@ func (s *s3client) Put(key string, in io.Reader) error {
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
 	} else {
-		data, err := ioutil.ReadAll(in)
+		data, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
@@ -143,7 +165,12 @@ func (s *s3client) Put(key string, in io.Reader) error {
 		ContentType: &mimeType,
 		Metadata:    map[string]*string{checksumAlgr: &checksum},
 	}
-	_, err := s.s3.PutObject(params)
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
+	}
+	var reqID string
+	_, err := s.s3.PutObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	ReqIDCache.put(key, reqID)
 	return err
 }
 
@@ -154,6 +181,9 @@ func (s *s3client) Copy(dst, src string) error {
 		Key:        &dst,
 		CopySource: &src,
 	}
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
+	}
 	_, err := s.s3.CopyObject(params)
 	return err
 }
@@ -163,20 +193,25 @@ func (s *s3client) Delete(key string) error {
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	_, err := s.s3.DeleteObject(&param)
+	var reqID string
+	_, err := s.s3.DeleteObjectWithContext(ctx, &param, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
 	if err != nil && strings.Contains(err.Error(), "NoSuchKey") {
 		err = nil
 	}
+	ReqIDCache.put(key, reqID)
 	return err
 }
 
-func (s *s3client) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *s3client) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	param := s3.ListObjectsInput{
 		Bucket:       &s.bucket,
 		Prefix:       &prefix,
 		Marker:       &marker,
 		MaxKeys:      &limit,
 		EncodingType: aws.String("url"),
+	}
+	if delimiter != "" {
+		param.Delimiter = &delimiter
 	}
 	resp, err := s.s3.ListObjects(&param)
 	if err != nil {
@@ -198,12 +233,23 @@ func (s *s3client) List(prefix, marker string, limit int64) ([]Object, error) {
 			*o.Size,
 			*o.LastModified,
 			strings.HasSuffix(oKey, "/"),
+			*o.StorageClass,
 		}
+	}
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			prefix, err := url.QueryUnescape(*p.Prefix)
+			if err != nil {
+				return nil, errors.WithMessagef(err, "failed to decode commonPrefixes %s", *p.Prefix)
+			}
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
 }
 
-func (s *s3client) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s *s3client) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -211,6 +257,9 @@ func (s *s3client) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 	params := &s3.CreateMultipartUploadInput{
 		Bucket: &s.bucket,
 		Key:    &key,
+	}
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
 	}
 	resp, err := s.s3.CreateMultipartUpload(params)
 	if err != nil {
@@ -233,6 +282,21 @@ func (s *s3client) UploadPart(key string, uploadID string, num int, body []byte)
 		return nil, err
 	}
 	return &Part{Num: num, ETag: *resp.ETag}, nil
+}
+
+func (s *s3client) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	resp, err := s.s3.UploadPartCopy(&s3.UploadPartCopyInput{
+		Bucket:          aws.String(s.bucket),
+		CopySource:      aws.String(s.bucket + "/" + srcKey),
+		CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+size-1)),
+		Key:             aws.String(key),
+		PartNumber:      aws.Int64(int64(num)),
+		UploadId:        aws.String(uploadID),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: *resp.CopyPartResult.ETag}, nil
 }
 
 func (s *s3client) AbortUpload(key string, uploadID string) {
@@ -280,6 +344,10 @@ func (s *s3client) ListUploads(marker string) ([]*PendingPart, string, error) {
 		nextMarker = *result.NextKeyMarker
 	}
 	return parts, nextMarker, nil
+}
+
+func (s *s3client) SetStorageClass(sc string) {
+	s.sc = sc
 }
 
 func autoS3Region(bucketName, accessKey, secretKey string) (string, error) {
@@ -467,7 +535,7 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 		return nil, fmt.Errorf("Fail to create aws session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &s3client{bucketName, s3.New(ses), ses}, nil
+	return &s3client{bucket: bucketName, s3: s3.New(ses), ses: ses}, nil
 }
 
 func init() {

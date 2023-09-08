@@ -22,7 +22,9 @@ package cmd
 import (
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
@@ -63,13 +65,6 @@ func cmdGateway() *cli.Command {
 		},
 	}
 
-	compoundFlags := [][]cli.Flag{
-		clientFlags(),
-		cacheFlags(0),
-		selfFlags,
-		shareInfoFlags(),
-	}
-
 	return &cli.Command{
 		Name:      "gateway",
 		Action:    gateway,
@@ -87,7 +82,7 @@ $ export MINIO_ROOT_PASSWORD=12345678
 $ juicefs gateway redis://localhost localhost:9000
 
 Details: https://juicefs.com/docs/community/s3_gateway`,
-		Flags: expandFlags(compoundFlags),
+		Flags: expandFlags(selfFlags, clientFlags(0), shareInfoFlags()),
 	}
 }
 
@@ -174,9 +169,8 @@ func (g *GateWay) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, er
 		conf,
 		&jfsgateway.Config{
 			MultiBucket: c.Bool("multi-buckets"),
-			KeepEtag: c.Bool("keep-etag"),
-			Mode: uint16(0666 &^ umask),
-			DirMode: uint16(0777 &^ umask),
+			KeepEtag:    c.Bool("keep-etag"),
+			Umask:       uint16(umask),
 		},
 	)
 }
@@ -189,14 +183,12 @@ func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.Fil
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-	registerer, registry := wrapRegister(mp, format.Name)
-	if !c.Bool("writeback") && c.IsSet("upload-delay") {
-		logger.Warnf("delayed upload only work in writeback mode")
+	if st := metaCli.Chroot(meta.Background, metaConf.Subdir); st != 0 {
+		logger.Fatalf("Chroot to %s: %s", metaConf.Subdir, st)
 	}
+	registerer, registry := wrapRegister(mp, format.Name)
 
-	blob, err := NewReloadableStorage(format, func() (*meta.Format, error) {
-		return getFormat(c, metaCli)
-	})
+	blob, err := NewReloadableStorage(format, metaCli, updateFormat(c))
 	if err != nil {
 		logger.Fatalf("object storage: %s", err)
 	}
@@ -206,11 +198,27 @@ func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.Fil
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
 
-	err = metaCli.NewSession()
+	err = metaCli.NewSession(true)
 	if err != nil {
 		logger.Fatalf("new session: %s", err)
 	}
+	metaCli.OnReload(func(fmt *meta.Format) {
+		updateFormat(c)(fmt)
+		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+	})
 
+	// Go will catch all the signals
+	signal.Ignore(syscall.SIGPIPE)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		sig := <-signalChan
+		logger.Infof("Received signal %s, exiting...", sig.String())
+		if err := metaCli.CloseSession(); err != nil {
+			logger.Fatalf("close session failed: %s", err)
+		}
+		os.Exit(0)
+	}()
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	vfsConf.AccessLog = c.String("access-log")
 	vfsConf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)

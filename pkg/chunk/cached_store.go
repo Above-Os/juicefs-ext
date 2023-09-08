@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -160,10 +161,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 			_ = in.Close()
 		}
 		used := time.Since(st)
-		logger.Debugf("GET %s RANGE(%d,%d) (%s, %.3fs)", key, boff, len(p), err, used.Seconds())
-		if used > SlowRequest {
-			logger.Infof("slow request: GET %s (%v, %.3fs)", key, err, used.Seconds())
-		}
+		logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", boff, len(p)), err, used)
 		s.store.objectDataBytes.WithLabelValues("GET").Add(float64(n))
 		s.store.objectReqsHistogram.WithLabelValues("GET").Observe(used.Seconds())
 		s.store.fetcher.fetch(key)
@@ -208,10 +206,7 @@ func (s *rSlice) delete(indx int) error {
 		strings.Contains(err.Error(), "No such file")) {
 		err = nil
 	}
-	logger.Debugf("DELETE %v (%v, %.3fs)", key, err, used.Seconds())
-	if used > SlowRequest {
-		logger.Infof("slow request: DELETE %v (%v, %.3fs)", key, err, used.Seconds())
-	}
+	logRequest("DELETE", key, "", err, used)
 	s.store.objectReqsHistogram.WithLabelValues("DELETE").Observe(used.Seconds())
 	if err != nil {
 		s.store.objectReqErrors.Add(1)
@@ -346,10 +341,7 @@ func (store *cachedStore) put(key string, p *Page) error {
 		st := time.Now()
 		err := store.storage.Put(key, bytes.NewReader(p.Data))
 		used := time.Since(st)
-		logger.Debugf("PUT %s (%s, %.3fs)", key, err, used.Seconds())
-		if used > SlowRequest {
-			logger.Infof("slow request: PUT %v (%v, %.3fs)", key, err, used.Seconds())
-		}
+		logRequest("PUT", key, "", err, used)
 		store.objectDataBytes.WithLabelValues("PUT").Add(float64(len(p.Data)))
 		store.objectReqsHistogram.WithLabelValues("PUT").Observe(used.Seconds())
 		if err != nil {
@@ -438,11 +430,8 @@ func (s *wSlice) upload(indx int) {
 						defer func() { <-s.store.currentUpload }()
 						if err = s.store.upload(key, block, nil); err == nil {
 							s.store.bcache.uploaded(key, blen)
-							if os.Remove(stagingPath) == nil {
-								if m, ok := s.store.bcache.(*cacheManager); ok {
-									m.stageBlocks.Sub(1)
-									m.stageBlockBytes.Sub(float64(blen))
-								}
+							if err := s.store.bcache.removeStage(key); err != nil {
+								logger.Warnf("failed to remove stage %s in upload", stagingPath)
 							}
 						} else { // add to delay list and wait for later scanning
 							s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
@@ -520,26 +509,69 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir       string
-	CacheMode      os.FileMode
-	CacheSize      int64
-	FreeSpace      float32
-	AutoCreate     bool
-	Compress       string
-	MaxUpload      int
-	MaxRetries     int
-	UploadLimit    int64 // bytes per second
-	DownloadLimit  int64 // bytes per second
-	Writeback      bool
-	UploadDelay    time.Duration
-	HashPrefix     bool
-	BlockSize      int
-	GetTimeout     time.Duration
-	PutTimeout     time.Duration
-	CacheFullBlock bool
-	BufferSize     int
-	Readahead      int
-	Prefetch       int
+	CacheDir          string
+	CacheMode         os.FileMode
+	CacheSize         int64
+	CacheChecksum     string
+	CacheEviction     string
+	CacheScanInterval time.Duration
+	FreeSpace         float32
+	AutoCreate        bool
+	Compress          string
+	MaxUpload         int
+	MaxRetries        int
+	UploadLimit       int64 // bytes per second
+	DownloadLimit     int64 // bytes per second
+	Writeback         bool
+	UploadDelay       time.Duration
+	HashPrefix        bool
+	BlockSize         int
+	GetTimeout        time.Duration
+	PutTimeout        time.Duration
+	CacheFullBlock    bool
+	BufferSize        int
+	Readahead         int
+	Prefetch          int
+}
+
+func (c *Config) SelfCheck(uuid string) {
+	if c.CacheSize == 0 {
+		if c.Writeback || c.Prefetch > 0 {
+			logger.Warnf("cache-size is 0, writeback and prefetch will be disabled")
+			c.Writeback = false
+			c.Prefetch = 0
+		}
+		c.CacheDir = "memory"
+	}
+	if !c.Writeback && c.UploadDelay > 0 {
+		logger.Warnf("delayed upload is disabled in non-writeback mode")
+		c.UploadDelay = 0
+	}
+	if c.MaxUpload <= 0 {
+		logger.Warnf("max-uploads should be greater than 0, set it to 1")
+		c.MaxUpload = 1
+	}
+	if c.BufferSize <= 32<<20 {
+		logger.Warnf("buffer-size should be more than 32 MiB")
+		c.BufferSize = 32 << 20
+	}
+	if c.CacheDir != "memory" {
+		ds := utils.SplitDir(c.CacheDir)
+		for i := range ds {
+			ds[i] = filepath.Join(ds[i], uuid)
+		}
+		c.CacheDir = strings.Join(ds, string(os.PathListSeparator))
+		if cs := []string{CsNone, CsFull, CsShrink, CsExtend}; !utils.StringContains(cs, c.CacheChecksum) {
+			logger.Warnf("verify-cache-checksum should be one of %v", cs)
+			c.CacheChecksum = CsFull
+		}
+	}
+	if c.CacheEviction == "" {
+		c.CacheEviction = "2-random"
+	} else if c.CacheEviction != "2-random" && c.CacheEviction != "none" {
+		logger.Warnf("cache-eviction should be one of [2-random, none]")
+		c.CacheEviction = "2-random"
+	}
 }
 
 type cachedStore struct {
@@ -565,6 +597,21 @@ type cachedStore struct {
 	objectReqsHistogram *prometheus.HistogramVec
 	objectReqErrors     prometheus.Counter
 	objectDataBytes     *prometheus.CounterVec
+	stageBlockDelay     prometheus.Counter
+}
+
+func logRequest(typeStr string, key string, param string, err error, used time.Duration) {
+	var info string
+	if id := object.ReqIDCache.Get(key); id != "" {
+		info += fmt.Sprintf("RequestID: %s ", id)
+	}
+	if err != nil {
+		info += err.Error()
+	}
+	logger.Debugf("%s %s %s(%v, %.3fs)", typeStr, key, param, info, used.Seconds())
+	if used > SlowRequest {
+		logger.Infof("slow request: %s %s %s(%v, %.3fs)", typeStr, key, param, info, used.Seconds())
+	}
 }
 
 func (store *cachedStore) load(key string, page *Page, cache bool, forceCache bool) (err error) {
@@ -612,10 +659,7 @@ func (store *cachedStore) load(key string, page *Page, cache bool, forceCache bo
 		err = nil
 	}
 	used := time.Since(start)
-	logger.Debugf("GET %s (%s, %.3fs)", key, err, used.Seconds())
-	if used > SlowRequest {
-		logger.Infof("slow request: GET %s (%v, %.3fs)", key, err, used.Seconds())
-	}
+	logRequest("GET", key, "", err, used)
 	if store.downLimit != nil && compressed {
 		store.downLimit.Wait(int64(n))
 	}
@@ -749,6 +793,10 @@ func (store *cachedStore) initMetrics() {
 		Name: "object_request_data_bytes",
 		Help: "Object requests size in bytes.",
 	}, []string{"method"})
+	store.stageBlockDelay = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "staging_block_delay_seconds",
+		Help: "Total seconds of delay for staging blocks",
+	})
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -763,6 +811,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
+	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "blockcache_blocks",
@@ -806,7 +855,8 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		logger.Debugf("Key %s is not needed, drop it", key)
 		return
 	}
-	f, err := os.Open(stagingPath)
+	blen := parseObjOrigSize(key)
+	f, err := openCacheFile(stagingPath, blen, store.conf.CacheChecksum)
 	if err != nil {
 		store.pendingMutex.Lock()
 		_, ok = store.pendingKeys[key]
@@ -818,9 +868,8 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		}
 		return
 	}
-	blen := parseObjOrigSize(key)
 	block := NewOffPage(blen)
-	_, err = io.ReadFull(f, block.Data)
+	_, err = f.ReadAt(block.Data, 0)
 	_ = f.Close()
 	if err != nil {
 		block.Release()
@@ -828,14 +877,12 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		return
 	}
 
+	store.stageBlockDelay.Add(time.Since(item.ts).Seconds())
 	if err = store.upload(key, block, nil); err == nil {
 		store.bcache.uploaded(key, blen)
 		store.removePending(key)
-		if os.Remove(stagingPath) == nil {
-			if m, ok := store.bcache.(*cacheManager); ok {
-				m.stageBlocks.Sub(1)
-				m.stageBlockBytes.Sub(float64(blen))
-			}
+		if err := store.bcache.removeStage(key); err != nil {
+			logger.Warnf("failed to remove stage %s, in upload staging file", stagingPath)
 		}
 	} else {
 		item.uploading = false
@@ -931,6 +978,27 @@ func (store *cachedStore) FillCache(id uint64, length uint32) error {
 
 func (store *cachedStore) UsedMemory() int64 {
 	return store.bcache.usedMemory()
+}
+
+func (store *cachedStore) UpdateLimit(upload, download int64) {
+	if upload = upload * 1e6 / 8; upload != store.conf.UploadLimit {
+		logger.Infof("Upload limit changed from %d to %d", store.conf.UploadLimit, upload)
+		store.conf.UploadLimit = upload
+		if upload > 0 {
+			store.upLimit = ratelimit.NewBucketWithRate(float64(upload)*0.85, upload)
+		} else {
+			store.upLimit = nil
+		}
+	}
+	if download = download * 1e6 / 8; download != store.conf.DownloadLimit {
+		logger.Infof("Download limit changed from %d to %d", store.conf.DownloadLimit, download)
+		store.conf.DownloadLimit = download
+		if download > 0 {
+			store.downLimit = ratelimit.NewBucketWithRate(float64(download)*0.85, download)
+		} else {
+			store.downLimit = nil
+		}
+	}
 }
 
 var _ ChunkStore = &cachedStore{}

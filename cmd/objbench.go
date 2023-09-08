@@ -21,10 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
-	"math/rand"
 	"os"
+	"os/user"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +35,7 @@ import (
 	osync "github.com/juicedata/juicefs/pkg/sync"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 func cmdObjbench() *cli.Command {
@@ -50,6 +51,8 @@ Run basic benchmarks on the target object storage to test if it works as expecte
 Examples:
 # Run benchmarks on S3
 $ ACCESS_KEY=myAccessKey SECRET_KEY=mySecretKey juicefs objbench --storage s3  https://mybucket.s3.us-east-2.amazonaws.com -p 6
+# Run benchmakks on JuiceFS
+$ juicefs objbench --storage jfs redis://localhost/1
 
 Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs-objbench`,
 		Flags: []cli.Flag{
@@ -111,6 +114,10 @@ var (
 	failed  = "failed"
 )
 
+type warning error
+
+var groupName string
+
 func objbench(ctx *cli.Context) error {
 	setup(ctx, 1)
 	for _, name := range []string{"big-object-size", "small-object-size", "block-size", "small-objects", "threads"} {
@@ -128,7 +135,15 @@ func objbench(ctx *cli.Context) error {
 	if token == "" {
 		token = os.Getenv("SESSION_TOKEN")
 	}
-	blobOrigin, err := object.CreateStorage(strings.ToLower(ctx.String("storage")), ctx.Args().First(), ak, sk, token)
+	endpoint := ctx.Args().First()
+	storageType := strings.ToLower(ctx.String("storage"))
+	if storageType == "file" {
+		var err error
+		if endpoint, err = filepath.Abs(endpoint); err != nil {
+			logger.Fatalf("invalid path: %s", err)
+		}
+	}
+	blobOrigin, err := object.CreateStorage(storageType, endpoint, ak, sk, token)
 	if err != nil {
 		logger.Fatalf("create storage failed: %v", err)
 	}
@@ -145,12 +160,22 @@ func objbench(ctx *cli.Context) error {
 	sCount := int(ctx.Uint("small-objects"))
 	threads := int(ctx.Uint("threads"))
 	colorful := utils.SupportANSIColor(os.Stdout.Fd())
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	if colorful {
 		nspt = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, YELLOW, nspt, RESET_SEQ)
 		skipped = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, YELLOW, skipped, RESET_SEQ)
 		pass = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, GREEN, pass, RESET_SEQ)
 		failed = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, RED, failed, RESET_SEQ)
+	}
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		logger.Fatalf("lookup nobody user failed: %v", err)
+	} else {
+		group, err := user.LookupGroupId(nobody.Gid)
+		if err != nil {
+			logger.Fatalf("lookup nobody's group failed: %v", err)
+		}
+		groupName = group.Name
 	}
 
 	if ctx.Bool("skip-functional-tests") {
@@ -317,8 +342,8 @@ func objbench(ctx *cli.Context) error {
 		seed:        make([]byte, bSize),
 		smallSeed:   make([]byte, smallBSize),
 	}
-	rand.Read(bm.seed)
-	rand.Read(bm.smallSeed)
+	randRead(bm.seed)
+	randRead(bm.smallSeed)
 
 	for _, api := range apis {
 		pResult = append(pResult, bm.run(api))
@@ -406,7 +431,7 @@ func (bm *benchMarkObj) run(api apiInfo) []string {
 			line[0] = api.title
 			return line
 		}
-		if api.name == "chown" && strings.HasPrefix(bm.blob.String(), "file://") && os.Getuid() != 0 {
+		if api.name == "chown" && (strings.HasPrefix(bm.blob.String(), "file://") || strings.HasPrefix(bm.blob.String(), "jfs://")) && os.Getuid() != 0 {
 			logger.Warnf("chown test should be run by root")
 			return []string{api.title, skipped, skipped}
 		}
@@ -543,14 +568,14 @@ func (bm *benchMarkObj) head(key string, startKey int) error {
 }
 
 func (bm *benchMarkObj) list(key string, startKey int) error {
-	result, err := osync.ListAll(bm.blob, "", "")
+	result, err := osync.ListAll(bm.blob, "", "", "", true)
 	for range result {
 	}
 	return err
 }
 
 func (bm *benchMarkObj) chown(key string, startKey int) error {
-	return bm.blob.(object.FileSystem).Chown(key, "nobody", "nogroup")
+	return bm.blob.(object.FileSystem).Chown(key, "nobody", groupName)
 }
 
 func (bm *benchMarkObj) chmod(key string, startKey int) error {
@@ -562,11 +587,7 @@ func (bm *benchMarkObj) chtimes(key string, startKey int) error {
 }
 
 func listAll(s object.ObjectStorage, prefix, marker string, limit int64) ([]object.Object, error) {
-	r, err := s.List(prefix, marker, limit)
-	if err == nil {
-		return r, nil
-	}
-	ch, err := s.ListAll(prefix, marker)
+	ch, err := object.ListAll(s, prefix, marker, true)
 	if err == nil {
 		objs := make([]object.Object, 0)
 		for obj := range ch {
@@ -591,12 +612,16 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		if err := fn(blob); err == utils.ENOTSUP {
 			r = nspt
 		} else if err != nil {
+			color := RED
+			if _, ok := err.(warning); ok {
+				color = YELLOW
+			}
 			r = err.Error()
 			if len(r) > 45 {
 				r = r[:45] + "..."
 			}
 			if colorful {
-				r = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, RED, r, RESET_SEQ)
+				r = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, color, r, RESET_SEQ)
 			}
 			logger.Debug(err.Error())
 		}
@@ -625,7 +650,7 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		if err != nil {
 			return "", err
 		}
-		data, err := ioutil.ReadAll(r)
+		data, err := io.ReadAll(r)
 		if err != nil {
 			return "", err
 		}
@@ -643,13 +668,13 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 				return fmt.Errorf("put object failed: %s", err)
 			}
 			defer blob.Delete(key) //nolint:errcheck
-			return fn()
+			return warning(fn())
 		})
 	}
 
 	runCase("create a bucket", func(blob object.ObjectStorage) error {
 		created := true
-		if err := blob.Put(key, bytes.NewReader(nil)); err != nil {
+		if err := blob.Put(key, bytes.NewReader([]byte("1"))); err != nil {
 			created = false
 		}
 		defer blob.Delete(key) //nolint:errcheck
@@ -721,11 +746,11 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		}
 		// get the end out of range
 		if d, e := get(blob, key, 4, 2); e != nil || d != "o" {
-			return fmt.Errorf(`failed to get object with the end out of range, expect "o", but got %q, error: %s`, d, e)
+			return warning(fmt.Errorf(`failed to get object with the end out of range, expect "o", but got %q, error: %s`, d, e))
 		}
 		// get the off out of range
 		if d, e := get(blob, key, 6, 2); e != nil || d != "" {
-			return fmt.Errorf(`failed to get object with the offset out of range, expect "", but got %q, error: %s`, d, e)
+			return warning(fmt.Errorf(`failed to get object with the offset out of range, expect "", but got %q, error: %s`, d, e))
 		}
 		return nil
 	})
@@ -867,10 +892,10 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 	runCase("special key", func(blob object.ObjectStorage) error {
 		key := "测试编码文件" + `{"name":"juicefs"}` + string('\u001F')
 		defer blob.Delete(key) //nolint:errcheck
-		if err := blob.Put(key, bytes.NewReader(nil)); err != nil {
+		if err := blob.Put(key, bytes.NewReader([]byte("1"))); err != nil {
 			return fmt.Errorf("put encode file failed: %s", err)
 		} else {
-			if resp, err := blob.List("", "测试编码文件", 1); err != nil && err != utils.ENOTSUP {
+			if resp, err := blob.List("", "测试编码文件", "", 1, true); err != nil && err != utils.ENOTSUP {
 				return fmt.Errorf("list encode file failed %s", err)
 			} else if len(resp) == 1 && resp[0].Key() != key {
 				return fmt.Errorf("list encode file failed: expect key %s, but got %s", key, resp[0].Key())
@@ -883,14 +908,14 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		fsize := 256 << 20
 		buffL := 4 << 20
 		buff := make([]byte, buffL)
-		rand.Read(buff)
+		randRead(buff)
 		count := int(math.Floor(float64(fsize) / float64(buffL)))
 		content := make([]byte, fsize)
 		for i := 0; i < count; i++ {
 			copy(content[i*buffL:(i+1)*buffL], buff)
 		}
 		if err := blob.Put(key, bytes.NewReader(content)); err != nil {
-			return fmt.Errorf("put big object failed: %s", err)
+			return err
 		}
 		defer blob.Delete(key) //nolint:errcheck
 		return nil
@@ -900,70 +925,81 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		// Copy empty objects
 		defer blob.Delete("empty_test_file") //nolint:errcheck
 		if err := blob.Put("empty_test_file", bytes.NewReader([]byte{})); err != nil {
-			return fmt.Errorf("put empty object failed: %s", err)
+			return err
 		}
 
 		// Copy `/` suffixed object
 		defer blob.Delete("slash_test_file/") //nolint:errcheck
-		if err := blob.Put("slash_test_file/", bytes.NewReader([]byte{})); err != nil {
+		if err := blob.Put("slash_test_file/", bytes.NewReader([]byte("1"))); err != nil {
 			return fmt.Errorf("put `/` suffixed object failed: %s", err)
 		}
 		return nil
 	})
 
-	runCase("multipart upload", func(blob object.ObjectStorage) error {
+	runCase("multipart upload", func(blob object.ObjectStorage) (err error) {
+		defer func() {
+			err = warning(err)
+		}()
+
 		key := "multi_test_file"
-		if err := blob.CompleteUpload(key, "notExistsUploadId", []*object.Part{}); err != utils.ENOTSUP {
+		if err = blob.CompleteUpload(key, "notExistsUploadId", []*object.Part{}); err != utils.ENOTSUP {
 			defer blob.Delete(key) //nolint:errcheck
-			partSize := 5 << 20
-			total := 10
-			seed := make([]byte, partSize)
-			rand.Read(seed)
 			upload, err := blob.CreateMultipartUpload(key)
 			if err != nil {
 				return fmt.Errorf("create multipart upload failed: %s", err)
 			}
+			total := 3
+			seed := make([]byte, upload.MinPartSize)
+			randRead(seed)
 			parts := make([]*object.Part, total)
 			content := make([][]byte, total)
 			for i := 0; i < total; i++ {
 				content[i] = getMockData(seed, i)
 			}
-			pool := make(chan struct{}, 4)
-			var wg sync.WaitGroup
+			var eg errgroup.Group
+			eg.SetLimit(4)
 			for i := 1; i <= total; i++ {
-				pool <- struct{}{}
-				wg.Add(1)
 				num := i
-				go func() {
-					defer func() {
-						<-pool
-						wg.Done()
-					}()
+				eg.Go(func() error {
+					var err error
 					parts[num-1], err = blob.UploadPart(key, upload.UploadID, num, content[num-1])
 					if err != nil {
-						logger.Fatalf("multipart upload error: %v", err)
+						err = fmt.Errorf("multipart upload error: %s", err)
 					}
-				}()
+					return err
+				})
 			}
-			wg.Wait()
-			// overwrite part
-			if parts[total-1], err = blob.UploadPart(key, upload.UploadID, total, getMockData(seed, total)); err != nil {
-				logger.Fatalf("multipart upload error: %v", err)
+			err = eg.Wait()
+			if err != nil {
+				return err
 			}
+			// overwrite the first part
+			firstPartContent := append(getMockData(seed, 0), getMockData(seed, 0)...)
+			if parts[0], err = blob.UploadPart(key, upload.UploadID, 1, firstPartContent); err != nil {
+				return fmt.Errorf("multipart upload error: %v", err)
+			}
+			content[0] = firstPartContent
+
+			// overwrite the last part
+			lastPartContent := []byte("hello")
+			if parts[total-1], err = blob.UploadPart(key, upload.UploadID, total, lastPartContent); err != nil {
+				return fmt.Errorf("multipart upload error: %v", err)
+			}
+			content[total-1] = lastPartContent
+
 			if err = blob.CompleteUpload(key, upload.UploadID, parts); err != nil {
-				logger.Fatalf("failed to complete multipart upload: %v", err)
+				return fmt.Errorf("failed to complete multipart upload: %v", err)
 			}
 			r, err := blob.Get(key, 0, -1)
 			if err != nil {
-				logger.Fatalf("failed to get multipart upload file: %v", err)
+				return fmt.Errorf("failed to get multipart upload file: %v", err)
 			}
 			cnt, err := io.ReadAll(r)
 			if err != nil {
-				logger.Fatalf("failed to get multipart upload file: %v", err)
+				return fmt.Errorf("failed to get multipart upload file: %v", err)
 			}
-			content[total-1] = getMockData(seed, total)
 			if !bytes.Equal(cnt, bytes.Join(content, nil)) {
-				logger.Fatal("the content of the multipart upload file is incorrect")
+				return fmt.Errorf("the content of the multipart upload file is incorrect")
 			}
 			return nil
 		}
@@ -971,10 +1007,10 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 	})
 
 	funFSCase("change owner/group", func() error {
-		if strings.HasPrefix(blob.String(), "file://") && os.Getuid() != 0 {
+		if (strings.HasPrefix(blob.String(), "file://") || strings.HasPrefix(blob.String(), "jfs://")) && os.Getuid() != 0 {
 			return errors.New("root required")
 		}
-		if err := fi.Chown(key, "nobody", "nogroup"); err != nil {
+		if err := fi.Chown(key, "nobody", groupName); err != nil {
 			return fmt.Errorf("failed to chown object %s", err)
 		}
 		if objInfo, err := blob.Head(key); err != nil {
@@ -983,8 +1019,8 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 			if info.Owner() != "nobody" {
 				return fmt.Errorf("expect owner nobody but got %s", info.Owner())
 			}
-			if info.Group() != "nogroup" {
-				return fmt.Errorf("expect group nogroup but got %s", info.Group())
+			if info.Group() != groupName {
+				return fmt.Errorf("expect group %s but got %s", groupName, info.Group())
 			}
 		}
 		return nil

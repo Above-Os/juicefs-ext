@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/sirupsen/logrus"
@@ -126,26 +127,26 @@ func prepareParent(m Meta, name string, inode *Ino) error {
 }
 
 func benchMkdir(b *testing.B, m Meta) {
-	var parent Ino
+	var parent, inode Ino
 	if err := prepareParent(m, "benchMkdir", &parent); err != nil {
 		b.Fatal(err)
 	}
 	ctx := Background
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := m.Mkdir(ctx, parent, fmt.Sprintf("d%d", i), 0755, 0, 0, nil, nil); err != 0 {
+		if err := m.Mkdir(ctx, parent, fmt.Sprintf("d%d", i), 0755, 0, 0, &inode, nil); err != 0 {
 			b.Fatalf("mkdir: %s", err)
 		}
 	}
 }
 
 func benchMvdir(b *testing.B, m Meta) { // rename dir
-	var parent Ino
+	var parent, inode Ino
 	if err := prepareParent(m, "benchMvdir", &parent); err != nil {
 		b.Fatal(err)
 	}
 	ctx := Background
-	if err := m.Mkdir(ctx, parent, "d0", 0755, 0, 0, nil, nil); err != 0 {
+	if err := m.Mkdir(ctx, parent, "d0", 0755, 0, 0, &inode, nil); err != 0 {
 		b.Fatalf("mkdir: %s", err)
 	}
 	b.ResetTimer()
@@ -157,7 +158,7 @@ func benchMvdir(b *testing.B, m Meta) { // rename dir
 }
 
 func benchRmdir(b *testing.B, m Meta) {
-	var parent Ino
+	var parent, inode Ino
 	if err := prepareParent(m, "benchRmdir", &parent); err != nil {
 		b.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func benchRmdir(b *testing.B, m Meta) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		if err := m.Mkdir(ctx, parent, "dir", 0755, 0, 0, nil, nil); err != 0 {
+		if err := m.Mkdir(ctx, parent, "dir", 0755, 0, 0, &inode, nil); err != 0 {
 			b.Fatalf("mkdir: %s", err)
 		}
 		b.StartTimer()
@@ -300,7 +301,7 @@ func benchLookup(b *testing.B, m Meta) {
 	var attr Attr
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := m.Lookup(ctx, parent, "file", &inode, &attr); err != 0 {
+		if err := m.Lookup(ctx, parent, "file", &inode, &attr, false); err != 0 {
 			b.Fatalf("lookup: %s", err)
 		}
 	}
@@ -536,7 +537,7 @@ func benchWrite(b *testing.B, m Meta) {
 		if err := m.NewSlice(ctx, &sliceId); err != 0 {
 			b.Fatalf("newchunk: %s", err)
 		}
-		if err := m.Write(ctx, inode, 0, offset, Slice{Id: sliceId, Size: step, Len: step}); err != 0 {
+		if err := m.Write(ctx, inode, 0, offset, Slice{Id: sliceId, Size: step, Len: step}, time.Now()); err != 0 {
 			b.Fatalf("write: %s", err)
 		}
 		offset += step
@@ -562,7 +563,7 @@ func benchRead(b *testing.B, m Meta, n int) {
 		if err := m.NewSlice(ctx, &sliceId); err != 0 {
 			b.Fatalf("newchunk: %s", err)
 		}
-		if err := m.Write(ctx, inode, 0, uint32(j)*step, Slice{Id: sliceId, Size: step, Len: step}); err != 0 {
+		if err := m.Write(ctx, inode, 0, uint32(j)*step, Slice{Id: sliceId, Size: step, Len: step}, time.Now()); err != 0 {
 			b.Fatalf("write: %s", err)
 		}
 	}
@@ -621,8 +622,8 @@ func benchmarkData(b *testing.B, m Meta) {
 }
 
 func benchmarkAll(b *testing.B, m Meta) {
-	_ = m.Init(Format{Name: "benchmarkAll"}, true)
-	_ = m.NewSession()
+	_ = m.Init(&Format{Name: "benchmarkAll", DirStats: true}, true)
+	_ = m.NewSession(false)
 	benchmarkDir(b, m)
 	benchmarkFile(b, m)
 	benchmarkXattr(b, m)
@@ -631,16 +632,16 @@ func benchmarkAll(b *testing.B, m Meta) {
 }
 
 func BenchmarkRedis(b *testing.B) {
-	m := NewClient(redisAddr, &Config{MaxDeletes: 2})
+	m := NewClient(redisAddr, nil)
 	benchmarkAll(b, m)
 }
 
 func BenchmarkSQL(b *testing.B) {
-	m := NewClient(sqlAddr, &Config{MaxDeletes: 2})
+	m := NewClient(sqlAddr, nil)
 	benchmarkAll(b, m)
 }
 
 func BenchmarkTKV(b *testing.B) {
-	m := NewClient(tkvAddr, &Config{MaxDeletes: 2})
+	m := NewClient(tkvAddr, nil)
 	benchmarkAll(b, m)
 }

@@ -17,12 +17,13 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
-	"path"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,10 +42,16 @@ const (
 	CompactChunk = 1001
 	// Rmr is a message to remove a directory recursively.
 	Rmr = 1002
-	// Info is a message to get the internal info for file or directory.
-	Info = 1003
+	// LegacyInfo is a message to get the internal info for file or directory.
+	LegacyInfo = 1003
 	// FillCache is a message to build cache for target directories/files
 	FillCache = 1004
+	// InfoV2 is a message to get the internal info for file or directory.
+	InfoV2 = 1005
+	// Clone is a message to clone a file or dir from another.
+	Clone = 1006
+	// OpSummary is a message to get tree summary of directories.
+	OpSummary = 1007
 )
 
 const (
@@ -61,6 +68,9 @@ const (
 	RenameNoReplace = 1 << iota
 	RenameExchange
 	RenameWhiteout
+	_renameReserved1
+	_renameReserved2
+	RenameRestore // internal
 )
 
 const (
@@ -74,12 +84,26 @@ const (
 	SetAttrCtime
 	SetAttrAtimeNow
 	SetAttrMtimeNow
+	SetAttrFlag = 1 << 15
+)
+
+const (
+	FlagImmutable = 1 << iota
+	FlagAppend
+)
+
+const (
+	QuotaSet uint8 = iota
+	QuotaGet
+	QuotaDel
+	QuotaList
+	QuotaCheck
 )
 
 const MaxName = 255
 const RootInode Ino = 1
 const TrashInode Ino = 0x7FFFFFFF10000000 // larger than vfs.minInternalNode
-const TrashName = ".trash"
+var TrashName = ".trash"
 
 func isTrash(ino Ino) bool {
 	return ino >= TrashInode
@@ -92,13 +116,14 @@ type internalNode struct {
 
 // Type of control messages
 const CPROGRESS = 0xFE // 16 bytes: progress increment
+const CDATA = 0xFF     // 4 bytes: data length
 
 // MsgCallback is a callback for messages from meta service.
 type MsgCallback func(...interface{}) error
 
 // Attr represents attributes of a node.
 type Attr struct {
-	Flags     uint8  // reserved flags
+	Flags     uint8  // flags
 	Typ       uint8  // type of a node
 	Mode      uint16 // permission mode
 	Uid       uint32 // owner id
@@ -211,9 +236,20 @@ type Summary struct {
 	Dirs   uint64
 }
 
+type TreeSummary struct {
+	Inode    Ino
+	Path     string
+	Type     uint8
+	Size     uint64
+	Files    uint64
+	Dirs     uint64
+	Children []*TreeSummary `json:",omitempty"`
+}
+
 type SessionInfo struct {
 	Version    string
 	HostName   string
+	IPAddrs    []string `json:",omitempty"`
 	MountPoint string
 	ProcessID  int
 }
@@ -227,7 +263,7 @@ type Flock struct {
 type Plock struct {
 	Inode   Ino
 	Owner   uint64
-	Records []byte // FIXME: loadLocks
+	Records []plockRecord
 }
 
 // Session contains detailed information of a client session
@@ -240,12 +276,40 @@ type Session struct {
 	Plocks    []Plock `json:",omitempty"`
 }
 
+type Quota struct {
+	MaxSpace, MaxInodes   int64
+	UsedSpace, UsedInodes int64
+	newSpace, newInodes   int64
+}
+
+// Returns true if it will exceed the quota limit
+func (q *Quota) check(space, inodes int64) bool {
+	if space > 0 {
+		max := atomic.LoadInt64(&q.MaxSpace)
+		if max > 0 && atomic.LoadInt64(&q.UsedSpace)+atomic.LoadInt64(&q.newSpace)+space > max {
+			return true
+		}
+	}
+	if inodes > 0 {
+		max := atomic.LoadInt64(&q.MaxInodes)
+		if max > 0 && atomic.LoadInt64(&q.UsedInodes)+atomic.LoadInt64(&q.newInodes)+inodes > max {
+			return true
+		}
+	}
+	return false
+}
+
+func (q *Quota) update(space, inodes int64) {
+	atomic.AddInt64(&q.newSpace, space)
+	atomic.AddInt64(&q.newInodes, inodes)
+}
+
 // Meta is a interface for a meta service for file system.
 type Meta interface {
 	// Name of database
 	Name() string
 	// Init is used to initialize a meta service.
-	Init(format Format, force bool) error
+	Init(format *Format, force bool) error
 	// Shutdown close current database connections.
 	Shutdown() error
 	// Reset cleans up all metadata, VERY DANGEROUS!
@@ -253,22 +317,30 @@ type Meta interface {
 	// Load loads the existing setting of a formatted volume from meta service.
 	Load(checkVersion bool) (*Format, error)
 	// NewSession creates a new client session.
-	NewSession() error
+	NewSession(record bool) error
 	// CloseSession does cleanup and close the session.
 	CloseSession() error
 	// GetSession retrieves information of session with sid
 	GetSession(sid uint64, detail bool) (*Session, error)
 	// ListSessions returns all client sessions.
 	ListSessions() ([]*Session, error)
+	// ScanDeletedObject scan deleted objects by customized scanner.
+	ScanDeletedObject(Context, trashSliceScan, pendingSliceScan, trashFileScan, pendingFileScan) error
+	// ListLocks returns all locks of a inode.
+	ListLocks(ctx context.Context, inode Ino) ([]PLockItem, []FLockItem, error)
 	// CleanStaleSessions cleans up sessions not active for more than 5 minutes
 	CleanStaleSessions()
+	// CleanupTrashBefore deletes all files in trash before the given time.
+	CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int))
+	// CleanupDetachedNodesBefore deletes all detached nodes before the given time.
+	CleanupDetachedNodesBefore(ctx Context, edge time.Time, increProgress func())
 
 	// StatFS returns summary statistics of a volume.
-	StatFS(ctx Context, totalspace, availspace, iused, iavail *uint64) syscall.Errno
+	StatFS(ctx Context, ino Ino, totalspace, availspace, iused, iavail *uint64) syscall.Errno
 	// Access checks the access permission on given inode.
 	Access(ctx Context, inode Ino, modemask uint8, attr *Attr) syscall.Errno
 	// Lookup returns the inode and attributes for the given entry in a directory.
-	Lookup(ctx Context, parent Ino, name string, inode *Ino, attr *Attr) syscall.Errno
+	Lookup(ctx Context, parent Ino, name string, inode *Ino, attr *Attr, checkPerm bool) syscall.Errno
 	// Resolve fetches the inode and attributes for an entry identified by the given path.
 	// ENOTSUP will be returned if there's no natural implementation for this operation or
 	// if there are any symlink following involved.
@@ -277,8 +349,10 @@ type Meta interface {
 	GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno
 	// SetAttr updates the attributes for given node.
 	SetAttr(ctx Context, inode Ino, set uint16, sggidclearmode uint8, attr *Attr) syscall.Errno
+	// Check setting attr is allowed or not
+	CheckSetAttr(ctx Context, inode Ino, set uint16, attr Attr) syscall.Errno
 	// Truncate changes the length for given file.
-	Truncate(ctx Context, inode Ino, flags uint8, attrlength uint64, attr *Attr) syscall.Errno
+	Truncate(ctx Context, inode Ino, flags uint8, attrlength uint64, attr *Attr, skipPermCheck bool) syscall.Errno
 	// Fallocate preallocate given space for given file.
 	Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64) syscall.Errno
 	// ReadLink returns the target of a symlink.
@@ -291,9 +365,9 @@ type Meta interface {
 	Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask uint16, copysgid uint8, inode *Ino, attr *Attr) syscall.Errno
 	// Unlink removes a file entry from a directory.
 	// The file will be deleted if it's not linked by any entries and not open by any sessions.
-	Unlink(ctx Context, parent Ino, name string) syscall.Errno
+	Unlink(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno
 	// Rmdir removes an empty sub-directory.
-	Rmdir(ctx Context, parent Ino, name string) syscall.Errno
+	Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno
 	// Rename move an entry from a source directory to another with given name.
 	// The targeted entry will be overwrited if it's a file or empty directory.
 	// For Hadoop, the target should not be overwritten.
@@ -313,13 +387,15 @@ type Meta interface {
 	// NewSlice returns an id for new slice.
 	NewSlice(ctx Context, id *uint64) syscall.Errno
 	// Write put a slice of data on top of the given chunk.
-	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice) syscall.Errno
+	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.
 	CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied *uint64) syscall.Errno
 	// GetParents returns a map of node parents (> 1 parents if hardlinked)
 	GetParents(ctx Context, inode Ino) map[Ino]int
+	// GetDirStat returns the space and inodes usage of a directory.
+	GetDirStat(ctx Context, inode Ino) (stat *dirStat, st syscall.Errno)
 
 	// GetXattr returns the value of extended attribute for given name.
 	GetXattr(ctx Context, inode Ino, name string, vbuff *[]byte) syscall.Errno
@@ -337,17 +413,37 @@ type Meta interface {
 	Setlk(ctx Context, inode Ino, owner uint64, block bool, ltype uint32, start, end uint64, pid uint32) syscall.Errno
 
 	// Compact all the chunks by merge small slices together
-	CompactAll(ctx Context, bar *utils.Bar) syscall.Errno
+	CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.Errno
 	// ListSlices returns all slices used by all files.
 	ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, showProgress func()) syscall.Errno
 	// Remove all files and directories recursively.
 	Remove(ctx Context, parent Ino, name string, count *uint64) syscall.Errno
+	// Get summary of a node; for a directory it will accumulate all its child nodes
+	GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno
+	// GetTreeSummary returns a summary in tree structure
+	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, updateProgress func(count uint64, bytes uint64)) syscall.Errno
+	// Clone a file or directory
+	Clone(ctx Context, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, count, total *uint64) syscall.Errno
+	// GetPaths returns all paths of an inode
+	GetPaths(ctx Context, inode Ino) []string
+	// Check integrity of an absolute path and repair it if asked
+	Check(ctx Context, fpath string, repair bool, recursive bool, statAll bool) error
+	// Change root to a directory specified by subdir
+	Chroot(ctx Context, subdir string) syscall.Errno
+	// chroot set the root directory by inode
+	chroot(inode Ino)
+	// Get a copy of the current format
+	GetFormat() Format
 
 	// OnMsg add a callback for the given message type.
 	OnMsg(mtype uint32, cb MsgCallback)
+	// OnReload register a callback for any change founded after reloaded.
+	OnReload(func(new *Format))
+
+	HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[string]*Quota, strict, repair bool) error
 
 	// Dump the tree under root, which may be modified by checkRoot
-	DumpMeta(w io.Writer, root Ino) error
+	DumpMeta(w io.Writer, root Ino, keepSecret bool) error
 	LoadMeta(r io.Reader) error
 
 	// getBase return the base engine.
@@ -403,95 +499,14 @@ func NewClient(uri string, conf *Config) Meta {
 	if !ok {
 		logger.Fatalf("Invalid meta driver: %s", driver)
 	}
+	if conf == nil {
+		conf = DefaultConf()
+	} else {
+		conf.SelfCheck()
+	}
 	m, err := f(driver, uri[p+3:], conf)
 	if err != nil {
 		logger.Fatalf("Meta %s is not available: %s", utils.RemovePassword(uri), err)
 	}
 	return m
-}
-
-// Get all paths of an inode
-func GetPaths(m Meta, ctx Context, inode Ino) []string {
-	if inode == RootInode {
-		return []string{"/"}
-	}
-
-	if inode == TrashInode {
-		return []string{"/.trash"}
-	}
-
-	base := m.getBase()
-	outside := "path not shown because it's outside of the mounted root"
-	getDirPath := func(ino Ino) (string, error) {
-		var names []string
-		var attr Attr
-		for ino != RootInode && ino != base.root {
-			if st := base.en.doGetAttr(ctx, ino, &attr); st != 0 {
-				return "", fmt.Errorf("getattr inode %d: %s", ino, st)
-			}
-			if attr.Typ != TypeDirectory {
-				return "", fmt.Errorf("inode %d is not a directory", ino)
-			}
-			var entries []*Entry
-			if st := base.en.doReaddir(ctx, attr.Parent, 0, &entries, -1); st != 0 {
-				return "", fmt.Errorf("readdir inode %d: %s", ino, st)
-			}
-			var name string
-			for _, e := range entries {
-				if e.Inode == ino {
-					name = string(e.Name)
-					break
-				}
-			}
-			if attr.Parent == RootInode && ino == TrashInode {
-				name = TrashName
-			}
-			if name == "" {
-				return "", fmt.Errorf("entry %d/%d not found", attr.Parent, ino)
-			}
-			names = append(names, name)
-			ino = attr.Parent
-		}
-		if base.root != RootInode && ino == RootInode {
-			return outside, nil
-		}
-		names = append(names, "/") // add root
-
-		for i, j := 0, len(names)-1; i < j; i, j = i+1, j-1 { // reverse
-			names[i], names[j] = names[j], names[i]
-		}
-		return path.Join(names...), nil
-	}
-
-	var paths []string
-	// inode != RootInode, parent is the real parent inode
-	for parent, count := range m.GetParents(ctx, inode) {
-		if count <= 0 {
-			continue
-		}
-		dir, err := getDirPath(parent)
-		if err != nil {
-			logger.Warnf("Get directory path of %d: %s", parent, err)
-			continue
-		} else if dir == outside {
-			paths = append(paths, outside)
-			continue
-		}
-		var entries []*Entry
-		if st := base.en.doReaddir(ctx, parent, 0, &entries, -1); st != 0 {
-			logger.Warnf("Readdir inode %d: %s", parent, st)
-			continue
-		}
-		var c int
-		for _, e := range entries {
-			if e.Inode == inode {
-				c++
-				paths = append(paths, path.Join(dir, string(e.Name)))
-			}
-		}
-		if c != count {
-			logger.Warnf("Expect to find %d entries under parent %d, but got %d", count, parent, c)
-		}
-	}
-	return paths
 }

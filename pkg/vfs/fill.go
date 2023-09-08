@@ -50,6 +50,12 @@ func (v *VFS) fillCache(ctx meta.Context, paths []string, concurrent int, count,
 				if err := v.fillInode(ctx, f.ino, f.size, bytes); err != nil {
 					logger.Errorf("Inode %d could be corrupted: %s", f.ino, err)
 				}
+				if v.Conf.Meta.OpenCache > 0 {
+					if err := v.Meta.Open(ctx, f.ino, syscall.O_RDONLY, &meta.Attr{}); err != 0 {
+						logger.Errorf("Inode %d could be opened: %s", f.ino, err)
+					}
+					_ = v.Meta.Close(ctx, f.ino)
+				}
 				if count != nil {
 					atomic.AddUint64(count, 1)
 				}
@@ -119,7 +125,7 @@ func (v *VFS) resolve(ctx meta.Context, p string, inode *Ino, attr *Attr) syscal
 				return err
 			}
 		}
-		if err = v.Meta.Lookup(ctx, parent, name, inode, attr); err != 0 {
+		if err = v.Meta.Lookup(ctx, parent, name, inode, attr, false); err != 0 {
 			return err
 		}
 		if attr.Typ == meta.TypeSymlink {

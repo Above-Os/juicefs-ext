@@ -28,8 +28,8 @@ var (
 	revisionDate = "$Format:%as$"
 	ver          = Semver{
 		major:      11,
-		minor:      0,
-		patch:      1,
+		minor:      1,
+		patch:      0,
 		preRelease: "",
 		build:      fmt.Sprintf("%s.%s", revisionDate, revision),
 	}

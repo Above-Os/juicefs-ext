@@ -1,107 +1,148 @@
 ---
-sidebar_label: Use JuiceFS on Docker
-sidebar_position: 2
+title: Use JuiceFS on Docker
+sidebar_position: 6
 slug: /juicefs_on_docker
+description: Different ways to use JuiceFS in Docker, including bind mount and Docker volume plugin, and mount inside container.
 ---
-# Use JuiceFS on Docker
 
-There are three ways to use JuiceFS with Docker:
-
-## 1. Volume Mapping {#volume-mapping}
-
-Volume mapping maps the directories in the JuiceFS mount point to the Docker container. For example, assuming a JuiceFS file system is mounted to the `/mnt/jfs` directory, you can map this file system when creating a docker container as follows:
+The simplest way would be using bind mount, you can directly mount JuiceFS into container using `-v`. Note that if host mount point isn't created by root, you'll have to enable [`allow_other`](../reference/fuse_mount_options.md#allow_other) to allow access inside container.
 
 ```shell
-sudo docker run -d --name nginx \
-  -v /mnt/jfs/html:/usr/share/nginx/html \
+docker run -d --name nginx \
+  -v /jfs/html:/usr/share/nginx/html \
   -p 8080:80 \
   nginx
 ```
 
-By default, only the user who mounts the JuiceFS file system has access permissions. To make a file system mappable for docker containers created by others, you need to enable FUSE option `user_allow_other` first, and then re-mount the file system with option `-o allow_other`.
+If you wish to control mount points using Docker, so that different application containers may use different JuiceFS file systems, you can use our [Docker volume plugin](https://github.com/juicedata/docker-volume-juicefs).
 
-> **Note**: JuiceFS file system mounted with root privilege has already enabled the `allow_other` option. Thus, you don't need to set it manually.
+## Docker volume plugin {#volume-plugin}
 
-### FUSE Settings
+Every Docker plugin itself is a Docker image, and JuiceFS Docker volume plugin is packed with [JuiceFS Community Edition](../introduction/README.md) as well as [JuiceFS Enterprise Edition](https://juicefs.com/docs/cloud) clients, after installation, you'll be able to run this plugin, and create JuiceFS Volume inside Docker.
 
-By default, the `allow_other` option is only available for users with root privilege. In order to allow other users to use this mount option, the FUSE configuration file needs to be modified.
-
-### Change the configuration file
-
-Edit the configuration file of FUSE, usually `/etc/fuse.conf`:
-
-```sh
-sudo nano /etc/fuse.conf
-```
-
-First, uncomment the line `# user_allow_other` by deleting the`#` symbol. Your configuration file should look like the following after the modification.
-
-```conf
-# /etc/fuse.conf - Configuration file for Filesystem in Userspace (FUSE)
-
-# Set the maximum number of FUSE mounts allowed to non-root users.
-# The default is 1000.
-#mount_max = 1000
-
-# Allow non-root users to specify the allow_other or allow_root mount options.
-user_allow_other
-```
-
-#### Re-mount JuiceFS
-
-Run the following command to re-mount the JuiceFS file system with `allow_other` option.
-
-```sh
-juicefs mount -d -o allow_other redis://<your-redis-url>:6379/1 /mnt/jfs
-```
-
-## 2. Docker Volume Plugin
-
-[Volume plugin](https://docs.docker.com/engine/extend/) is another option to access JuiceFS.
-
-```sh
-$ docker plugin install juicedata/juicefs
-Plugin "juicedata/juicefs" is requesting the following privileges:
- - network: [host]
- - device: [/dev/fuse]
- - capabilities: [CAP_SYS_ADMIN]
-Do you grant the above permissions? [y/N]
-
-$ docker volume create -d juicedata/juicefs:latest -o name={{VOLUME_NAME}} -o metaurl={{META_URL}} -o access-key={{ACCESS_KEY}} -o secret-key={{SECRET_KEY}} jfsvolume
-$ docker run -it -v jfsvolume:/opt busybox ls /opt
-```
-
-Replace `{{VOLUME_NAME}}`, `{{META_URL}}`, `{{ACCESS_KEY}}` and `{{SECRET_KEY}}` to fit your situation. For more details about JuiceFS volume plugin, please refer to [juicedata/docker-volume-juicefs](https://github.com/juicedata/docker-volume-juicefs) repository.
-
-## 3. Mount JuiceFS in a Container
-
-In this section, we introduce a way to mount and use JuiceFS file system directly in a Docker container. Compared with [volume mapping](#volume-mapping), directly mounting reduces the chance of misoperating files. It also makes container management clearer and more intuitive.
-
-To mount a JuiceFS file system in a Docker container, the JuiceFS client executable needs to be copied into the image. Usually, this could be done by writing the commands that download or copy the executable and mount the file system into your Dockerfile, and rebuild the image. You can refer to the following Dockerfile as an example which packs the JuiceFS client into the Alpine image.
-
-```dockerfile
-FROM alpine:latest
-LABEL maintainer="Juicedata <https://juicefs.com>"
-
-# Install JuiceFS client
-RUN apk add --no-cache curl && \
-  JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v') && \
-  wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  tar -zxf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  install juicefs /usr/bin && \
-  rm juicefs "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  rm -rf /var/cache/apk/* && \
-  apk del curl
-
-ENTRYPOINT ["/usr/bin/juicefs", "mount"]
-```
-
-In addition, using FUSE in a container requires specific permissions. You need to specify the `--privileged=true` option on creating. For example:
+Install the plugin with the following command, grant permissions when asked:
 
 ```shell
-sudo docker run -d --name nginx \
-  -v /mnt/jfs/html:/usr/share/nginx/html \
-  -p 8080:80 \
-  --privileged=true \
-  nginx-with-jfs
+docker plugin install juicedata/juicefs
 ```
+
+You can manage volume plugin with the following commands:
+
+```shell
+# Disable the volume plugin
+docker plugin disable juicedata/juicefs
+
+# Upgrade plugin (need to disable first)
+docker plugin upgrade juicedata/juicefs
+docker plugin enable juicedata/juicefs
+
+# Uninstall plugin
+docker plugin rm juicedata/juicefs
+```
+
+### Create a storage volume {#create-volume}
+
+In the following command, replace `<VOLUME_NAME>`, `<META_URL>`, `<STORAGE_TYPE>`, `<BUCKET_NAME>`, `<ACCESS_KEY>`, `<SECRET_KEY>` accordingly.
+
+```shell
+docker volume create -d juicedata/juicefs \
+  -o name=<VOLUME_NAME> \
+  -o metaurl=<META_URL> \
+  -o storage=<STORAGE_TYPE> \
+  -o bucket=<BUCKET_NAME> \
+  -o access-key=<ACCESS_KEY> \
+  -o secret-key=<SECRET_KEY> \
+  jfsvolume
+```
+
+To use Docker volume plugin with existing JuiceFS volumes, simply specify the file system name and database address:
+
+```shell
+docker volume create -d juicedata/juicefs \
+  -o name=<VOLUME_NAME> \
+  -o metaurl=<META_URL> \
+  jfsvolume
+```
+
+If you need to pass extra environment variables to the mount process (e.g. [Google Cloud](../reference/how_to_set_up_object_storage.md#google-cloud)), append them as `-o env=FOO=bar,SPAM=egg`.
+
+### Usage and management {#usage-and-management}
+
+```shell
+# Mount the volume in container
+docker run -it -v jfsvolume:/opt busybox ls /opt
+
+# After a volume has been unmounted, delete using the following command
+# Deleting a volume only remove the relevant resources from Docker, which doesn't affect data stored in JuiceFS
+docker volume rm jfsvolume
+```
+
+### Using Docker Compose {#using-docker-compose}
+
+Example for creating and mounting JuiceFS volume with `docker-compose`:
+
+```yaml
+version: '3'
+services:
+busybox:
+  image: busybox
+  command: "ls /jfs"
+  volumes:
+    - jfsvolume:/jfs
+volumes:
+  jfsvolume:
+    driver: juicedata/juicefs
+    driver_opts:
+      name: ${VOL_NAME}
+      metaurl: ${META_URL}
+      storage: ${STORAGE_TYPE}
+      bucket: ${BUCKET}
+      access-key: ${ACCESS_KEY}
+      secret-key: ${SECRET_KEY}
+      # Pass extra environment variables using env
+      # env: FOO=bar,SPAM=egg
+```
+
+Common management commands:
+
+```shell
+# Start the service
+docker-compose up
+
+# Shut down the service and remove Docker volumes
+docker-compose down --volumes
+```
+
+### Troubleshooting {#troubleshooting}
+
+If JuiceFS Docker volume plugin is not working properly, it's recommend to [upgrade the volume plugin](#volume-plugin) first, and then check logs to debug.
+
+* Collect JuiceFS Client logs, which is inside the Docker volume plugin container itself:
+
+  ```shell
+  # locate the docker plugins runtime directory, your environment may differ from below example
+  # container directories will be printed, directory name is container ID
+  ls /run/docker/plugins/runtime-root/plugins.moby
+
+  # print plugin container info
+  # if container list is empty, that means plugin container didn't start properly
+  # read the next step to continue debugging
+  runc --root /run/docker/plugins/runtime-root/plugins.moby list
+
+  # collect log inside plugin container
+  runc --root /run/docker/plugins/runtime-root/plugins.moby exec 452d2c0cf3fd45e73a93a2f2b00d03ed28dd2bc0c58669cca9d4039e8866f99f cat /var/log/juicefs.log
+  ```
+
+  If it is found that the container doesn't exist (`ls` found that the directory is empty), or that `juicefs.log` doesn't exist, this usually indicates a bad mount, check plugin logs to further debug.
+
+* Collect plugin log, for example under systemd:
+
+  ```shell
+  journalctl -f -u docker | grep "plugin="
+  ```
+
+  `juicefs` is called to perform the actual mount inside the plugin container, if any error occurs, it will be shown in the Docker daemon logs, same when there's error with the volume plugin itself.
+
+## Mount JuiceFS in a Container {#mount-juicefs-in-docker}
+
+Mounting JuiceFS in a Docker container usually serves two purposes, one is to provide storage for the applications in the container, and the other is to map the mount point inside container to the host. To do so, you can use the officially maintained images or build your own image for customization. See [Customize Container Image](https://juicefs.com/docs/csi/guide/custom-image).

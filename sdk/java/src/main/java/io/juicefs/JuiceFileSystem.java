@@ -15,6 +15,7 @@
  */
 package io.juicefs;
 
+import io.juicefs.utils.BgTaskUtil;
 import io.juicefs.utils.PatchUtil;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -29,8 +30,11 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.URI;
 import java.security.PrivilegedExceptionAction;
+<<<<<<< HEAD
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+=======
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
 import java.util.concurrent.TimeUnit;
 
 /****************************************************************
@@ -44,7 +48,10 @@ public class JuiceFileSystem extends FilterFileSystem {
   private static boolean fileChecksumEnabled = false;
   private static boolean distcpPatched = false;
 
+<<<<<<< HEAD
   private ScheduledExecutorService emptier;
+=======
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
   private FileSystem emptierFs;
 
   static {
@@ -70,6 +77,7 @@ public class JuiceFileSystem extends FilterFileSystem {
   public void initialize(URI uri, Configuration conf) throws IOException {
     super.initialize(uri, conf);
     fileChecksumEnabled = Boolean.parseBoolean(getConf(conf, "file.checksum", "false"));
+<<<<<<< HEAD
     startTrashEmptier(uri, conf);
   }
 
@@ -80,6 +88,17 @@ public class JuiceFileSystem extends FilterFileSystem {
       return t;
     });
 
+=======
+    if (!Boolean.parseBoolean(getConf(conf, "disable-trash-emptier", "false"))) {
+      startTrashEmptier(uri, conf);
+    }
+  }
+
+  private void startTrashEmptier(URI uri, final Configuration conf) throws IOException {
+    if (BgTaskUtil.isRunning(uri.getHost(), "Trash emptier")) {
+      return;
+    }
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
     try {
       UserGroupInformation superUser = UserGroupInformation.createRemoteUser(getConf(conf, "superuser", "hdfs"));
       emptierFs = superUser.doAs((PrivilegedExceptionAction<FileSystem>) () -> {
@@ -87,7 +106,11 @@ public class JuiceFileSystem extends FilterFileSystem {
         fs.initialize(uri, conf);
         return fs;
       });
+<<<<<<< HEAD
       emptier.schedule(new Trash(emptierFs, conf).getEmptier(), 10, TimeUnit.MINUTES);
+=======
+      BgTaskUtil.startTrashEmptier(uri.getHost(), "Trash emptier", emptierFs, new Trash(emptierFs, conf).getEmptier(), TimeUnit.MINUTES.toMillis(10));
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
     } catch (Exception e) {
       throw new IOException("start trash failed!",e);
     }
@@ -151,6 +174,7 @@ public class JuiceFileSystem extends FilterFileSystem {
     patchDistCpChecksum();
     return super.getFileChecksum(f);
   }
+<<<<<<< HEAD
 
   @Override
   public void close() throws IOException {
@@ -160,4 +184,6 @@ public class JuiceFileSystem extends FilterFileSystem {
     }
     super.close();
   }
+=======
+>>>>>>> 08c4ae6229535e45a73b2a9cc4b80faf01282593
 }

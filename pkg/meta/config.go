@@ -32,22 +32,45 @@ import (
 
 // Config for clients.
 type Config struct {
-	Strict      bool // update ctime
-	Retries     int
-	MaxDeletes  int
-	CaseInsensi bool
-	ReadOnly    bool
-	NoBGJob     bool // disable background jobs like clean-up, backup, etc.
-	OpenCache   time.Duration
-	Heartbeat   time.Duration
-	MountPoint  string
-	Subdir      string
+	Strict             bool // update ctime
+	Retries            int
+	MaxDeletes         int
+	SkipDirNlink       int
+	CaseInsensi        bool
+	ReadOnly           bool
+	NoBGJob            bool // disable background jobs like clean-up, backup, etc.
+	OpenCache          time.Duration
+	OpenCacheLimit     uint64 // max number of files to cache (soft limit)
+	Heartbeat          time.Duration
+	MountPoint         string
+	Subdir             string
+	AtimeMode          string
+	DirStatFlushPeriod time.Duration
+}
+
+func DefaultConf() *Config {
+	return &Config{Strict: true, Retries: 10, MaxDeletes: 2, Heartbeat: 12 * time.Second, AtimeMode: NoAtime, DirStatFlushPeriod: 1 * time.Second}
+}
+
+func (c *Config) SelfCheck() {
+	if c.MaxDeletes == 0 {
+		logger.Warnf("Deleting object will be disabled since max-deletes is 0")
+	}
+	if c.Heartbeat != 0 && c.Heartbeat < time.Second {
+		logger.Warnf("heartbeat should not be less than 1 second")
+		c.Heartbeat = time.Second
+	}
+	if c.Heartbeat > time.Minute*10 {
+		logger.Warnf("heartbeat shouldd not be greater than 10 minutes")
+		c.Heartbeat = time.Minute * 10
+	}
 }
 
 type Format struct {
 	Name             string
 	UUID             string
 	Storage          string
+	StorageClass     string `json:",omitempty"`
 	Bucket           string
 	AccessKey        string `json:",omitempty"`
 	SecretKey        string `json:",omitempty"`
@@ -59,11 +82,15 @@ type Format struct {
 	Capacity         uint64 `json:",omitempty"`
 	Inodes           uint64 `json:",omitempty"`
 	EncryptKey       string `json:",omitempty"`
+	EncryptAlgo      string `json:",omitempty"`
 	KeyEncrypted     bool   `json:",omitempty"`
-	TrashDays        int    `json:",omitempty"`
+	UploadLimit      int64  `json:",omitempty"` // Mbps
+	DownloadLimit    int64  `json:",omitempty"` // Mbps
+	TrashDays        int
 	MetaVersion      int    `json:",omitempty"`
 	MinClientVersion string `json:",omitempty"`
 	MaxClientVersion string `json:",omitempty"`
+	DirStats         bool   `json:",omitempty"`
 }
 
 func (f *Format) update(old *Format, force bool) error {
@@ -74,8 +101,6 @@ func (f *Format) update(old *Format, force bool) error {
 		switch {
 		case f.Name != old.Name:
 			args = []interface{}{"name", old.Name, f.Name}
-		case f.Storage != old.Storage:
-			args = []interface{}{"storage", old.Storage, f.Storage}
 		case f.BlockSize != old.BlockSize:
 			args = []interface{}{"block size", old.BlockSize, f.BlockSize}
 		case f.Compression != old.Compression:

@@ -18,12 +18,12 @@ package meta
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/goccy/go-json"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -55,6 +55,7 @@ type DumpedSustained struct {
 
 type DumpedAttr struct {
 	Inode     Ino    `json:"inode"`
+	Flags     uint8  `json:"flags,omitempty"`
 	Type      string `json:"type"`
 	Mode      uint16 `json:"mode"`
 	Uid       uint32 `json:"uid"`
@@ -68,6 +69,7 @@ type DumpedAttr struct {
 	Nlink     uint32 `json:"nlink"`
 	Length    uint64 `json:"length"`
 	Rdev      uint32 `json:"rdev,omitempty"`
+	full      bool
 }
 
 type DumpedSlice struct {
@@ -87,6 +89,13 @@ type DumpedChunk struct {
 type DumpedXattr struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+type DumpedQuota struct {
+	MaxSpace   int64 `json:"maxSpace"`
+	MaxInodes  int64 `json:"maxInodes"`
+	UsedSpace  int64 `json:"-"`
+	UsedInodes int64 `json:"-"`
 }
 
 type DumpedEntry struct {
@@ -244,8 +253,9 @@ type DumpedMeta struct {
 	Counters  *DumpedCounters
 	Sustained []*DumpedSustained
 	DelFiles  []*DumpedDelFile
-	FSTree    *DumpedEntry `json:",omitempty"`
-	Trash     *DumpedEntry `json:",omitempty"`
+	Quotas    map[Ino]*DumpedQuota `json:",omitempty"`
+	FSTree    *DumpedEntry         `json:",omitempty"`
+	Trash     *DumpedEntry         `json:",omitempty"`
 }
 
 func (dm *DumpedMeta) writeJsonWithOutTree(w io.Writer) (*bufio.Writer, error) {
@@ -263,8 +273,19 @@ func (dm *DumpedMeta) writeJsonWithOutTree(w io.Writer) (*bufio.Writer, error) {
 	return bw, nil
 }
 
+func (m *baseMeta) loadDumpedQuotas(ctx Context, quotas map[Ino]*DumpedQuota) {
+	// update quota
+	for inode, q := range quotas {
+		if err := m.en.doSetQuota(ctx, inode, &Quota{q.MaxSpace, q.MaxInodes, q.UsedSpace, q.UsedInodes, 0, 0}, true); err != nil {
+			logger.Warnf("reset quota of %d: %s", inode, err)
+			continue
+		}
+	}
+}
+
 func dumpAttr(a *Attr, d *DumpedAttr) {
 	d.Type = typeToString(a.Typ)
+	d.Flags = a.Flags
 	d.Mode = a.Mode
 	d.Uid = a.Uid
 	d.Gid = a.Gid
@@ -281,11 +302,12 @@ func dumpAttr(a *Attr, d *DumpedAttr) {
 	} else {
 		d.Length = 0
 	}
+	d.full = a.Full
 }
 
 func loadAttr(d *DumpedAttr) *Attr {
 	return &Attr{
-		// Flags:     0,
+		Flags:     d.Flags,
 		Typ:       typeFromString(d.Type),
 		Mode:      d.Mode,
 		Uid:       d.Uid,
@@ -315,7 +337,7 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 		return
 	}
 
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	bar := progress.AddCountBar("Loaded entries", 1) // with root
 	dm = &DumpedMeta{}
 	counters = &DumpedCounters{ // rebuild counters
@@ -344,10 +366,12 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 			err = dec.Decode(&dm.Sustained)
 		case "DelFiles":
 			err = dec.Decode(&dm.DelFiles)
+		case "Quotas":
+			err = dec.Decode(&dm.Quotas)
 		case "FSTree":
-			_, err = decodeEntry(dec, 0, counters, parents, refs, bar, load, addChunk)
+			_, err = decodeEntry(dec, 0, counters, parents, dm.Quotas, refs, bar, load, addChunk)
 		case "Trash":
-			_, err = decodeEntry(dec, 1, counters, parents, refs, bar, load, addChunk)
+			_, err = decodeEntry(dec, 1, counters, parents, nil, refs, bar, load, addChunk)
 		}
 		if err != nil {
 			err = fmt.Errorf("load %v: %s", name, err)
@@ -361,7 +385,7 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 	return
 }
 
-func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino,
+func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino, quotas map[Ino]*DumpedQuota,
 	refs map[chunkKey]int64, bar *utils.Bar, load func(*DumpedEntry), addChunk func(*chunkKey)) (*DumpedEntry, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, err
@@ -427,6 +451,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 		case "entries":
 			e.Entries = make(map[string]*DumpedEntry)
 			_, err = dec.Token()
+			var usedSpace, usedInodes int64
 			if err == nil {
 				for dec.More() {
 					var n json.Token
@@ -435,7 +460,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						break
 					}
 					var child *DumpedEntry
-					child, err = decodeEntry(dec, e.Attr.Inode, cs, parents, refs, bar, load, addChunk)
+					child, err = decodeEntry(dec, e.Attr.Inode, cs, parents, quotas, refs, bar, load, addChunk)
 					if err != nil {
 						break
 					}
@@ -444,12 +469,27 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 					}
 					e.Entries[n.(string)] = &DumpedEntry{
 						Attr: &DumpedAttr{
-							Inode: child.Attr.Inode,
-							Type:  child.Attr.Type,
+							Inode:  child.Attr.Inode,
+							Type:   child.Attr.Type,
+							Length: child.Attr.Length,
 						},
 					}
+					usedSpace += align4K(child.Attr.Length)
+					usedInodes++
 				}
 				if err == nil {
+					i := e.Attr.Inode
+					for {
+						if q := quotas[i]; q != nil {
+							q.UsedSpace += usedSpace
+							q.UsedInodes += usedInodes
+						}
+						if i <= 1 || len(parents[i]) == 0 {
+							break
+						}
+						i = parents[i][0]
+					}
+
 					var t json.Token
 					t, err = dec.Token()
 					if err == nil && t != json.Delim('}') {

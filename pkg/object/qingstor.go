@@ -23,12 +23,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
 
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/qingstor/qingstor-sdk-go/v4/config"
@@ -38,10 +40,21 @@ import (
 
 type qingstor struct {
 	bucket *qs.Bucket
+	sc     string
 }
 
 func (q *qingstor) String() string {
 	return fmt.Sprintf("qingstor://%s/", *q.bucket.Properties.BucketName)
+}
+
+func (q *qingstor) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              4 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
 }
 
 func (q *qingstor) Create() error {
@@ -64,6 +77,7 @@ func (q *qingstor) Head(key string) (Object, error) {
 		*r.ContentLength,
 		*r.LastModified,
 		strings.HasSuffix(key, "/"),
+		*r.XQSStorageClass,
 	}, nil
 }
 
@@ -74,6 +88,9 @@ func (q *qingstor) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		input.Range = &rangeStr
 	}
 	output, err := q.bucket.GetObject(key, input)
+	if output != nil {
+		ReqIDCache.put(key, aws.StringValue(output.RequestID))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +126,7 @@ func findLen(in io.Reader) (io.Reader, int64, error) {
 			return nil, 0, err
 		}
 	default:
-		d, err := ioutil.ReadAll(in)
+		d, err := io.ReadAll(in)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -130,7 +147,13 @@ func (q *qingstor) Put(key string, in io.Reader) error {
 		ContentLength: &vlen,
 		ContentType:   &mimeType,
 	}
+	if q.sc != "" {
+		input.XQSStorageClass = &q.sc
+	}
 	out, err := q.bucket.PutObject(key, input)
+	if out != nil {
+		ReqIDCache.put(key, aws.StringValue(out.RequestID))
+	}
 	if err != nil {
 		return err
 	}
@@ -145,6 +168,9 @@ func (q *qingstor) Copy(dst, src string) error {
 	input := &qs.PutObjectInput{
 		XQSCopySource: &source,
 	}
+	if q.sc != "" {
+		input.XQSStorageClass = &q.sc
+	}
 	out, err := q.bucket.PutObject(dst, input)
 	if err != nil {
 		return err
@@ -156,11 +182,14 @@ func (q *qingstor) Copy(dst, src string) error {
 }
 
 func (q *qingstor) Delete(key string) error {
-	_, err := q.bucket.DeleteObject(key)
+	output, err := q.bucket.DeleteObject(key)
+	if output != nil {
+		ReqIDCache.put(key, aws.StringValue(output.RequestID))
+	}
 	return err
 }
 
-func (q *qingstor) List(prefix, marker string, limit int64) ([]Object, error) {
+func (q *qingstor) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
@@ -169,6 +198,9 @@ func (q *qingstor) List(prefix, marker string, limit int64) ([]Object, error) {
 		Prefix: &prefix,
 		Marker: &marker,
 		Limit:  &limit_,
+	}
+	if delimiter != "" {
+		input.Delimiter = &delimiter
 	}
 	out, err := q.bucket.ListObjects(input)
 	if err != nil {
@@ -183,17 +215,28 @@ func (q *qingstor) List(prefix, marker string, limit int64) ([]Object, error) {
 			*k.Size,
 			time.Unix(int64(*k.Modified), 0),
 			strings.HasSuffix(*k.Key, "/"),
+			*k.StorageClass,
 		}
+	}
+	if delimiter != "" {
+		for _, p := range out.CommonPrefixes {
+			objs = append(objs, &obj{*p, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
 }
 
-func (q *qingstor) ListAll(prefix, marker string) (<-chan Object, error) {
+func (q *qingstor) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
 func (q *qingstor) CreateMultipartUpload(key string) (*MultipartUpload, error) {
-	r, err := q.bucket.InitiateMultipartUpload(key, nil)
+	var input qs.InitiateMultipartUploadInput
+	if q.sc != "" {
+		input.XQSStorageClass = &q.sc
+	}
+	r, err := q.bucket.InitiateMultipartUpload(key, &input)
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +254,20 @@ func (q *qingstor) UploadPart(key string, uploadID string, num int, data []byte)
 		return nil, err
 	}
 	return &Part{Num: num, Size: len(data), ETag: strings.Trim(*r.ETag, "\"")}, nil
+}
+
+func (q *qingstor) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	input := &qs.UploadMultipartInput{
+		UploadID:      &uploadID,
+		PartNumber:    &num,
+		XQSCopySource: aws.String(fmt.Sprintf("/%s/%s", *q.bucket.Properties.BucketName, srcKey)),
+		XQSCopyRange:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+size-1)),
+	}
+	r, err := q.bucket.UploadMultipart(key, input)
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, Size: int(size), ETag: strings.Trim(*r.ETag, "\"")}, nil
 }
 
 func (q *qingstor) AbortUpload(key string, uploadID string) {
@@ -253,6 +310,10 @@ func (q *qingstor) ListUploads(marker string) ([]*PendingPart, string, error) {
 		nextMarker = *result.NextKeyMarker
 	}
 	return parts, nextMarker, nil
+}
+
+func (q *qingstor) SetStorageClass(sc string) {
+	q.sc = sc
 }
 
 func newQingStor(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {

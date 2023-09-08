@@ -20,7 +20,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -47,14 +47,14 @@ Examples:
 $ juicefs profile /mnt/jfs
 
 # Replay an access log
-$ cat /mnt/jfs/.accesslog > /tmp/jfs.alog
+$ cat /mnt/jfs/.accesslog > /tmp/juicefs.accesslog
 # Press Ctrl-C to stop the "cat" command after some time
-$ juicefs profile /tmp/jfs.alog
+$ juicefs profile /tmp/juicefs.accesslog
 
 # Analyze an access log and print the total statistics immediately
-$ juicefs profile /tmp/jfs.alog --interval 0
+$ juicefs profile /tmp/juicefs.accesslog --interval 0
 
-Details: https://juicefs.com/docs/community/operations_profiling`,
+Details: https://juicefs.com/docs/community/fault_diagnosis_and_analysis#profile`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "uid",
@@ -346,7 +346,11 @@ func profile(ctx *cli.Context) error {
 		if inode != uint64(meta.RootInode) {
 			logger.Fatalf("Path %s is not a mount point!", logPath)
 		}
-		logPath = path.Join(logPath, ".accesslog")
+		if p := filepath.Join(logPath, ".jfs.accesslog"); utils.Exists(p) {
+			logPath = p
+		} else {
+			logPath = filepath.Join(logPath, ".accesslog")
+		}
 	} else { // log file to be replayed
 		replay = true
 	}

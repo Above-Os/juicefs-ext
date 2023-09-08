@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -121,7 +120,7 @@ func (u *ufile) parseResp(resp *http.Response, out interface{}) error {
 	defer resp.Body.Close()
 	var data []byte
 	if resp.ContentLength <= 0 || resp.ContentLength > (1<<31) {
-		d, err := ioutil.ReadAll(resp.Body)
+		d, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return err
 		}
@@ -149,7 +148,7 @@ func copyObj(store ObjectStorage, dst, src string) error {
 		return err
 	}
 	defer in.Close()
-	d, err := ioutil.ReadAll(in)
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -200,7 +199,11 @@ type uFileListObjectsOutput struct {
 	DataSet []*DataItem `json:"DataSet,omitempty"`
 }
 
-func (u *ufile) List(prefix, marker string, limit int64) ([]Object, error) {
+func (u *ufile) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
+	if delimiter != "" {
+		// TODO: or US3?
+		return nil, notSupported
+	}
 	query := url.Values{}
 	query.Add("list", "")
 	query.Add("prefix", prefix)
@@ -220,7 +223,7 @@ func (u *ufile) List(prefix, marker string, limit int64) ([]Object, error) {
 	}
 	objs := make([]Object, len(out.DataSet))
 	for i, item := range out.DataSet {
-		objs[i] = &obj{item.FileName, item.Size, time.Unix(int64(item.ModifyTime), 0), strings.HasSuffix(item.FileName, "/")}
+		objs[i] = &obj{item.FileName, item.Size, time.Unix(int64(item.ModifyTime), 0), strings.HasSuffix(item.FileName, "/"), ""}
 	}
 	return objs, nil
 }
@@ -245,7 +248,7 @@ func (u *ufile) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 }
 
 func (u *ufile) UploadPart(key string, uploadID string, num int, data []byte) (*Part, error) {
-	// UFile require the PartNumber to start from 0 (continious)
+	// UFile require the PartNumber to start from 0 (continuous)
 	num--
 	path := fmt.Sprintf("%s?uploadId=%s&partNumber=%d", key, uploadID, num)
 	resp, err := u.request("PUT", path, bytes.NewReader(data), nil)

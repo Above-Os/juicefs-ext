@@ -25,7 +25,9 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
@@ -40,6 +42,7 @@ type gs struct {
 	bucket    string
 	region    string
 	pageToken string
+	sc        string
 }
 
 func (g *gs) String() string {
@@ -48,7 +51,7 @@ func (g *gs) String() string {
 
 func (g *gs) Create() error {
 	// check if the bucket is already exists
-	if objs, err := g.List("", "", 1); err == nil && len(objs) > 0 {
+	if objs, err := g.List("", "", "", 1, true); err == nil && len(objs) > 0 {
 		return nil
 	}
 
@@ -71,14 +74,11 @@ func (g *gs) Create() error {
 		if err == nil && len(zone) > 2 {
 			g.region = zone[:len(zone)-2]
 		}
-		if g.region == "" {
-			return errors.New("Could not guess region to create bucket")
-		}
 	}
 
 	err := g.client.Bucket(g.bucket).Create(ctx, projectID, &storage.BucketAttrs{
 		Name:         g.bucket,
-		StorageClass: "regional",
+		StorageClass: g.sc,
 		Location:     g.region,
 	})
 	if err != nil && strings.Contains(err.Error(), "You already own this bucket") {
@@ -101,6 +101,7 @@ func (g *gs) Head(key string) (Object, error) {
 		attrs.Size,
 		attrs.Updated,
 		strings.HasSuffix(key, "/"),
+		attrs.StorageClass,
 	}, nil
 }
 
@@ -114,6 +115,7 @@ func (g *gs) Get(key string, off, limit int64) (io.ReadCloser, error) {
 
 func (g *gs) Put(key string, data io.Reader) error {
 	writer := g.client.Bucket(g.bucket).Object(key).NewWriter(ctx)
+	writer.StorageClass = g.sc
 	_, err := io.Copy(writer, data)
 	if err != nil {
 		return err
@@ -124,7 +126,11 @@ func (g *gs) Put(key string, data io.Reader) error {
 func (g *gs) Copy(dst, src string) error {
 	srcObj := g.client.Bucket(g.bucket).Object(src)
 	dstObj := g.client.Bucket(g.bucket).Object(dst)
-	_, err := dstObj.CopierFrom(srcObj).Run(ctx)
+	copier := dstObj.CopierFrom(srcObj)
+	if g.sc != "" {
+		copier.StorageClass = g.sc
+	}
+	_, err := copier.Run(ctx)
 	return err
 }
 
@@ -135,12 +141,12 @@ func (g *gs) Delete(key string) error {
 	return nil
 }
 
-func (g *gs) List(prefix, marker string, limit int64) ([]Object, error) {
+func (g *gs) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	if marker != "" && g.pageToken == "" {
 		// last page
 		return nil, nil
 	}
-	objectIterator := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	objectIterator := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix, Delimiter: delimiter})
 	pager := iterator.NewPager(objectIterator, int(limit), g.pageToken)
 	var entries []*storage.ObjectAttrs
 	nextPageToken, err := pager.NextPage(&entries)
@@ -152,9 +158,20 @@ func (g *gs) List(prefix, marker string, limit int64) ([]Object, error) {
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		item := entries[i]
-		objs[i] = &obj{item.Name, item.Size, item.Updated, strings.HasSuffix(item.Name, "/")}
+		if delimiter != "" && item.Prefix != "" {
+			objs[i] = &obj{item.Prefix, 0, time.Unix(0, 0), true, item.StorageClass}
+		} else {
+			objs[i] = &obj{item.Name, item.Size, item.Updated, strings.HasSuffix(item.Name, "/"), item.StorageClass}
+		}
+	}
+	if delimiter != "" {
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
 	}
 	return objs, nil
+}
+
+func (g *gs) SetStorageClass(sc string) {
+	g.sc = sc
 }
 
 func newGS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {

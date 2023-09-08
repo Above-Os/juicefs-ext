@@ -25,6 +25,7 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 )
 
@@ -50,51 +51,55 @@ $ juicefs config redis://localhost --trash-days 7
 
 # Limit client version that is allowed to connect
 $ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version 1.1.0`,
-		Flags: []cli.Flag{
-			&cli.Uint64Flag{
-				Name:  "capacity",
-				Usage: "hard quota of the volume limiting its usage of space in GiB",
-			},
-			&cli.Uint64Flag{
-				Name:  "inodes",
-				Usage: "hard quota of the volume limiting its number of inodes",
-			},
-			&cli.StringFlag{
-				Name:  "bucket",
-				Usage: "the bucket URL of object storage to store data",
-			},
-			&cli.StringFlag{
-				Name:  "access-key",
-				Usage: "access key for object storage",
-			},
-			&cli.StringFlag{
-				Name:  "secret-key",
-				Usage: "secret key for object storage",
-			},
-			&cli.StringFlag{
-				Name:  "session-token",
-				Usage: "session token for object storage",
-			},
-			&cli.BoolFlag{
-				Name:  "encrypt-secret",
-				Usage: "encrypt the secret key if it was previously stored in plain format",
-			},
-			&cli.IntFlag{
-				Name:  "trash-days",
-				Usage: "number of days after which removed files will be permanently deleted",
-			},
-			&cli.StringFlag{
-				Name:  "min-client-version",
-				Usage: "minimum client version allowed to connect",
-			},
-			&cli.StringFlag{
-				Name:  "max-client-version",
-				Usage: "maximum client version allowed to connect",
-			},
-			&cli.BoolFlag{
-				Name:  "force",
-				Usage: "skip sanity check and force update the configurations",
-			},
+		Flags: expandFlags(
+			formatStorageFlags(),
+			addCategories("DATA STORAGE", []cli.Flag{
+				&cli.Int64Flag{
+					Name:  "upload-limit",
+					Usage: "default bandwidth limit of a client for upload in Mbps",
+				},
+				&cli.Int64Flag{
+					Name:  "download-limit",
+					Usage: "default bandwidth limit of a client for download in Mbps",
+				},
+			}),
+			formatManagementFlags(),
+			configManagementFlags(),
+			configFlags()),
+	}
+}
+
+func configManagementFlags() []cli.Flag {
+	return addCategories("MANAGEMENT", []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "encrypt-secret",
+			Usage: "encrypt the secret key if it was previously stored in plain format",
+		},
+		&cli.StringFlag{
+			Name:  "min-client-version",
+			Usage: "minimum client version allowed to connect",
+		},
+		&cli.StringFlag{
+			Name:  "max-client-version",
+			Usage: "maximum client version allowed to connect",
+		},
+		&cli.BoolFlag{
+			Name:  "dir-stats",
+			Usage: "enable dir stats, which is necessary for fast summary and dir quota",
+		},
+	})
+}
+
+func configFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.BoolFlag{
+			Name:    "yes",
+			Aliases: []string{"y"},
+			Usage:   "automatically answer 'yes' to all prompts and run non-interactively",
+		},
+		&cli.BoolFlag{
+			Name:  "force",
+			Usage: "skip sanity check and force update the configurations",
 		},
 	}
 }
@@ -121,7 +126,7 @@ func userConfirmed() bool {
 func config(ctx *cli.Context) error {
 	setup(ctx, 1)
 	removePassword(ctx.Args().Get(0))
-	m := meta.NewClient(ctx.Args().Get(0), &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(ctx.Args().Get(0), nil)
 
 	format, err := m.Load(false)
 	if err != nil {
@@ -132,6 +137,7 @@ func config(ctx *cli.Context) error {
 		return nil
 	}
 
+	originDirStats := format.DirStats
 	var quota, storage, trash, clientVer bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
@@ -148,6 +154,12 @@ func config(ctx *cli.Context) error {
 				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.Inodes, new))
 				format.Inodes = new
 				quota = true
+			}
+		case "storage":
+			if new := ctx.String(flag); new != format.Storage {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Storage, new))
+				format.Storage = new
+				storage = true
 			}
 		case "bucket":
 			if new := ctx.String(flag); new != format.Bucket {
@@ -182,6 +194,22 @@ func config(ctx *cli.Context) error {
 			}
 			format.SessionToken = ctx.String(flag)
 			storage = true
+		case "storage-class": // always update
+			if new := ctx.String(flag); new != format.StorageClass {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.StorageClass, new))
+				format.StorageClass = new
+				storage = true
+			}
+		case "upload-limit":
+			if new := ctx.Int64(flag); new != format.UploadLimit {
+				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.UploadLimit, new))
+				format.UploadLimit = new
+			}
+		case "download-limit":
+			if new := ctx.Int64(flag); new != format.DownloadLimit {
+				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.DownloadLimit, new))
+				format.DownloadLimit = new
+			}
 		case "trash-days":
 			if new := ctx.Int(flag); new != format.TrashDays {
 				if new < 0 {
@@ -190,6 +218,11 @@ func config(ctx *cli.Context) error {
 				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.TrashDays, new))
 				format.TrashDays = new
 				trash = true
+			}
+		case "dir-stats":
+			if new := ctx.Bool(flag); new != format.DirStats {
+				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.DirStats, new))
+				format.DirStats = new
 			}
 		case "min-client-version":
 			if new := ctx.String(flag); new != format.MinClientVersion {
@@ -217,6 +250,7 @@ func config(ctx *cli.Context) error {
 	}
 
 	if !ctx.Bool("force") {
+		yes := ctx.Bool("yes")
 		if storage {
 			blob, err := createStorage(*format)
 			if err != nil {
@@ -228,26 +262,40 @@ func config(ctx *cli.Context) error {
 		}
 		if quota {
 			var totalSpace, availSpace, iused, iavail uint64
-			_ = m.StatFS(meta.Background, &totalSpace, &availSpace, &iused, &iavail)
+			_ = m.StatFS(meta.Background, meta.RootInode, &totalSpace, &availSpace, &iused, &iavail)
 			usedSpace := totalSpace - availSpace
 			if format.Capacity > 0 && usedSpace >= format.Capacity ||
 				format.Inodes > 0 && iused >= format.Inodes {
 				warn("New quota is too small (used / quota): %d / %d bytes, %d / %d inodes.",
 					usedSpace, format.Capacity, iused, format.Inodes)
-				if !userConfirmed() {
+				if !yes && !userConfirmed() {
 					return fmt.Errorf("Aborted.")
 				}
 			}
 		}
 		if trash && format.TrashDays == 0 {
 			warn("The current trash will be emptied and future removed files will purged immediately.")
-			if !userConfirmed() {
+			if !yes && !userConfirmed() {
 				return fmt.Errorf("Aborted.")
+			}
+		}
+		if originDirStats && !format.DirStats {
+			qs := make(map[string]*meta.Quota)
+			err := m.HandleQuota(meta.Background, meta.QuotaList, "", qs, false, false)
+			if err != nil {
+				return errors.Wrap(err, "list quotas")
+			}
+			if len(qs) != 0 {
+				paths := make([]string, 0, len(qs))
+				for path := range qs {
+					paths = append(paths, path)
+				}
+				return fmt.Errorf("cannot disable dir stats when there are still %d dir quotas: %v", len(qs), paths)
 			}
 		}
 		if clientVer && format.CheckVersion() != nil {
 			warn("Clients with the same version of this will be rejected after modification.")
-			if !userConfirmed() {
+			if !yes && !userConfirmed() {
 				return fmt.Errorf("Aborted.")
 			}
 		}
@@ -258,7 +306,7 @@ func config(ctx *cli.Context) error {
 			logger.Fatalf("Format encrypt: %s", err)
 		}
 	}
-	if err = m.Init(*format, false); err == nil {
+	if err = m.Init(format, false); err == nil {
 		fmt.Println(msg.String()[:msg.Len()-1])
 	}
 	return err

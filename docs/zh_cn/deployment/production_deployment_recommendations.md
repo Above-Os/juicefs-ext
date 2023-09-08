@@ -1,11 +1,12 @@
 ---
 sidebar_position: 1
 slug: /production_deployment_recommendations
+description: 本文面向即将把 JuiceFS 部署到生产环境的用户参考，提供一系列环境配置建议。
 ---
 
 # 生产环境部署建议
 
-本文旨在给出一些部署 JuiceFS 至生产环境时的有效建议，请提前并仔细阅读以下内容。
+生产环境的注意事项在这里罗列介绍。
 
 ## 监控指标收集与可视化
 
@@ -27,7 +28,7 @@ slug: /production_deployment_recommendations
 备份元数据所需的时间取决于具体的元数据引擎，不同元数据引擎会有不同的性能表现。
 :::
 
-有关元数据自动备份的详细介绍请参考[文档](../administration/metadata_dump_load.md#自动备份)，你也可以手动备份元数据。除此之外，也请遵照你所使用的元数据引擎的运维建议对数据进行定期备份。
+有关元数据自动备份的详细介绍请参考[文档](../administration/metadata_dump_load.md#backup-automatically)，你也可以手动备份元数据。除此之外，也请遵照你所使用的元数据引擎的运维建议对数据进行定期备份。
 
 ## 回收站
 
@@ -87,4 +88,4 @@ logrotate -d /etc/logrotate.d/juicefs
 
 ## 命令行自动补全
 
-JuiceFS 为 Bash 和 Zsh 提供了命令行自动补全脚本，方便在命令行中使用 `juicefs` 命令，具体请参考[文档](../reference/command_reference.md#自动补全)。
+JuiceFS 为 Bash 和 Zsh 提供了命令行自动补全脚本，方便在命令行中使用 `juicefs` 命令，具体请参考[文档](../reference/command_reference.md#auto-completion)。

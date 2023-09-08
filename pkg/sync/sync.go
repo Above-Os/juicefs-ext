@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"runtime"
@@ -48,8 +47,9 @@ const (
 
 var (
 	handled                  *utils.Bar
+	pending                  *utils.Bar
 	copied, copiedBytes      *utils.Bar
-	checkedBytes             *utils.Bar
+	checked, checkedBytes    *utils.Bar
 	deleted, skipped, failed *utils.Bar
 	concurrent               chan int
 	limiter                  *ratelimit.Bucket
@@ -73,35 +73,25 @@ func formatSize(bytes int64) string {
 }
 
 // ListAll on all the keys that starts at marker from object storage.
-func ListAll(store object.ObjectStorage, start, end string) (<-chan object.Object, error) {
+func ListAll(store object.ObjectStorage, prefix, start, end string, followLink bool) (<-chan object.Object, error) {
 	startTime := time.Now()
-	logger.Debugf("Iterating objects from %s start %q", store, start)
+	logger.Debugf("Iterating objects from %s with prefix %s start %q", store, prefix, start)
 
 	out := make(chan object.Object, maxResults*10)
 
 	// As the result of object storage's List method doesn't include the marker key,
 	// we try List the marker key separately.
-	if start != "" {
+	if start != "" && strings.HasPrefix(start, prefix) {
 		if obj, err := store.Head(start); err == nil {
 			logger.Debugf("Found start key: %s from %s in %s", start, store, time.Since(startTime))
 			out <- obj
 		}
 	}
 
-	if ch, err := store.ListAll("", start); err == nil {
-		if end == "" {
-			go func() {
-				for obj := range ch {
-					out <- obj
-				}
-				close(out)
-			}()
-			return out, nil
-		}
-
+	if ch, err := store.ListAll(prefix, start, followLink); err == nil {
 		go func() {
 			for obj := range ch {
-				if obj != nil && obj.Key() > end {
+				if obj != nil && end != "" && obj.Key() > end {
 					break
 				}
 				out <- obj
@@ -115,7 +105,10 @@ func ListAll(store object.ObjectStorage, start, end string) (<-chan object.Objec
 
 	marker := start
 	logger.Debugf("Listing objects from %s marker %q", store, marker)
-	objs, err := store.List("", marker, maxResults)
+	objs, err := store.List(prefix, marker, "", maxResults, followLink)
+	if err == utils.ENOTSUP {
+		return object.ListAllWithDelimiter(store, prefix, start, end, followLink)
+	}
 	if err != nil {
 		logger.Errorf("Can't list %s: %s", store, err.Error())
 		return nil, err
@@ -150,13 +143,13 @@ func ListAll(store object.ObjectStorage, start, end string) (<-chan object.Objec
 			marker = lastkey
 			startTime = time.Now()
 			logger.Debugf("Continue listing objects from %s marker %q", store, marker)
-			objs, err = store.List("", marker, maxResults)
+			objs, err = store.List(prefix, marker, "", maxResults, followLink)
 			count := 0
 			for err != nil && count < 3 {
 				logger.Warnf("Fail to list: %s, retry again", err.Error())
 				// slow down
 				time.Sleep(time.Millisecond * 100)
-				objs, err = store.List("", marker, maxResults)
+				objs, err = store.List(prefix, marker, "", maxResults, followLink)
 				count++
 			}
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
@@ -189,6 +182,7 @@ func try(n int, f func() error) (err error) {
 		if err == nil {
 			return
 		}
+		logger.Debugf("Try %d failed: %s", i+1, err)
 		time.Sleep(time.Second * time.Duration(i*i))
 	}
 	return
@@ -196,7 +190,8 @@ func try(n int, f func() error) (err error) {
 
 func deleteObj(storage object.ObjectStorage, key string, dry bool) {
 	if dry {
-		logger.Infof("Will delete %s from %s", key, storage)
+		logger.Debugf("Will delete %s from %s", key, storage)
+		deleted.Increment()
 		return
 	}
 	start := time.Now()
@@ -220,7 +215,7 @@ func copyPerms(dst object.ObjectStorage, obj object.Object) {
 	key := obj.Key()
 	fi := obj.(object.File)
 	if err := dst.(object.FileSystem).Chmod(key, fi.Mode()); err != nil {
-		logger.Warnf("Chmod %s to %d: %s", key, fi.Mode(), err)
+		logger.Warnf("Chmod %s to %o: %s", key, fi.Mode(), err)
 	}
 	if err := dst.(object.FileSystem).Chown(key, fi.Owner(), fi.Group()); err != nil {
 		logger.Warnf("Chown %s to (%s,%s): %s", key, fi.Owner(), fi.Group(), err)
@@ -314,6 +309,7 @@ func checkSum(src, dst object.ObjectStorage, key string, size int64) (bool, erro
 	var equal bool
 	err := try(3, func() error { return doCheckSum(src, dst, key, size, &equal) })
 	if err == nil {
+		checked.Increment()
 		checkedBytes.IncrInt64(size)
 		if equal {
 			logger.Debugf("Checked %s OK (and equal) in %s,", key, time.Since(start))
@@ -326,8 +322,8 @@ func checkSum(src, dst object.ObjectStorage, key string, size int64) (bool, erro
 	return equal, err
 }
 
-var streamRead = map[string]struct{}{"file": {}, "hdfs": {}, "sftp": {}}
-var streamWrite = map[string]struct{}{"file": {}, "hdfs": {}, "sftp": {}, "gs": {}, "wasb": {}, "ceph": {}, "swift": {}, "webdav": {}, "upyun": {}, "jfs": {}}
+var fastStreamRead = map[string]struct{}{"file": {}, "hdfs": {}, "jfs": {}, "gluster": {}}
+var streamWrite = map[string]struct{}{"file": {}, "hdfs": {}, "sftp": {}, "gs": {}, "wasb": {}, "ceph": {}, "swift": {}, "webdav": {}, "upyun": {}, "jfs": {}, "gluster": {}}
 var readInMem = map[string]struct{}{"mem": {}, "etcd": {}, "redis": {}, "tikv": {}, "mysql": {}, "postgres": {}, "sqlite3": {}}
 
 func inMap(obj object.ObjectStorage, m map[string]struct{}) bool {
@@ -336,6 +332,42 @@ func inMap(obj object.ObjectStorage, m map[string]struct{}) bool {
 }
 
 func doCopySingle(src, dst object.ObjectStorage, key string, size int64) error {
+	if size > maxBlock && !inMap(dst, readInMem) && !inMap(src, fastStreamRead) {
+		var err error
+		var in io.Reader
+		downer := newParallelDownloader(src, key, size, 10<<20, concurrent)
+		defer downer.Close()
+		if inMap(dst, streamWrite) {
+			in = downer
+		} else {
+			var f *os.File
+			// download the object into disk
+			if f, err = os.CreateTemp("", "rep"); err != nil {
+				logger.Warnf("create temp file: %s", err)
+				goto SINGLE
+			}
+			_ = os.Remove(f.Name()) // will be deleted after Close()
+			defer f.Close()
+			buf := bufPool.Get().(*[]byte)
+			defer bufPool.Put(buf)
+			if _, err = io.CopyBuffer(struct{ io.Writer }{f}, downer, *buf); err == nil {
+				_, err = f.Seek(0, 0)
+				in = f
+			}
+		}
+		if err == nil {
+			err = dst.Put(key, in)
+		}
+		if err != nil {
+			if _, e := src.Head(key); os.IsNotExist(e) {
+				logger.Debugf("Head src %s: %s", key, err)
+				copied.IncrInt64(-1)
+				err = nil
+			}
+		}
+		return err
+	}
+SINGLE:
 	if limiter != nil {
 		limiter.Wait(size)
 	}
@@ -353,37 +385,17 @@ func doCopySingle(src, dst object.ObjectStorage, key string, size int64) error {
 			if _, e := src.Head(key); os.IsNotExist(e) {
 				logger.Debugf("Head src %s: %s", key, err)
 				copied.IncrInt64(-1)
-				copiedBytes.IncrInt64(size * (-1))
-				return nil
+				err = nil
 			}
 			return err
 		}
 	}
-
 	defer in.Close()
 
-	if size <= maxBlock || inMap(dst, readInMem) || inMap(src, streamRead) || inMap(dst, streamWrite) {
-		return dst.Put(key, in)
-	} else { // obj.Size > maxBlock, download the object into disk first
-		f, err := ioutil.TempFile("", "rep")
-		if err != nil {
-			return err
-		}
-		_ = os.Remove(f.Name()) // will be deleted after Close()
-		defer f.Close()
-
-		// in is not *os.File, use bufPool
-		buf := bufPool.Get().(*[]byte)
-		defer bufPool.Put(buf)
-		if _, err = io.CopyBuffer(struct{ io.Writer }{f}, in, *buf); err != nil {
-			return err
-		}
-		// upload
-		if _, err = f.Seek(0, 0); err != nil {
-			return err
-		}
-		return dst.Put(key, f)
+	if err = dst.Put(key, in); err == nil {
+		copiedBytes.IncrInt64(size)
 	}
+	return err
 }
 
 func doCopyMultiple(src, dst object.ObjectStorage, key string, size int64, upload *object.MultipartUpload) error {
@@ -462,14 +474,12 @@ func doCopyMultiple(src, dst object.ObjectStorage, key string, size int64, uploa
 
 func copyData(src, dst object.ObjectStorage, key string, size int64) error {
 	start := time.Now()
-	var multiple bool
 	var err error
 	if size < maxBlock {
 		err = try(3, func() error { return doCopySingle(src, dst, key, size) })
 	} else {
 		var upload *object.MultipartUpload
 		if upload, err = dst.CreateMultipartUpload(key); err == nil {
-			multiple = true
 			err = doCopyMultiple(src, dst, key, size, upload)
 		} else if err == utils.ENOTSUP {
 			err = try(3, func() error { return doCopySingle(src, dst, key, size) })
@@ -483,9 +493,6 @@ func copyData(src, dst object.ObjectStorage, key string, size int64) error {
 		}
 	}
 	if err == nil {
-		if !multiple {
-			copiedBytes.IncrInt64(size)
-		}
 		logger.Debugf("Copied data of %s (%d bytes) in %s", key, size, time.Since(start))
 	} else {
 		logger.Errorf("Failed to copy data of %s in %s: %s", key, time.Since(start), err)
@@ -503,14 +510,15 @@ func worker(tasks <-chan object.Object, src, dst object.ObjectStorage, config *C
 			deleteObj(dst, key, config.Dry)
 		case markCopyPerms:
 			if config.Dry {
-				logger.Infof("Will copy permissions for %s", key)
-				break
+				logger.Debugf("Will copy permissions for %s", key)
+			} else {
+				copyPerms(dst, obj)
 			}
-			copyPerms(dst, obj)
 			copied.Increment()
 		case markChecksum:
 			if config.Dry {
-				logger.Infof("Will compare checksum for %s", key)
+				logger.Debugf("Will compare checksum for %s", key)
+				checked.Increment()
 				break
 			}
 			obj = obj.(*withSize).Object
@@ -541,14 +549,15 @@ func worker(tasks <-chan object.Object, src, dst object.ObjectStorage, config *C
 			fallthrough
 		default:
 			if config.Dry {
-				logger.Infof("Will copy %s (%d bytes)", obj.Key(), obj.Size())
+				logger.Debugf("Will copy %s (%d bytes)", obj.Key(), obj.Size())
+				copied.Increment()
+				copiedBytes.IncrInt64(obj.Size())
 				break
 			}
 			var err error
 			if config.Links && obj.IsSymlink() {
 				if err = copyLink(src, dst, key); err == nil {
 					copied.Increment()
-					handled.Increment()
 					break
 				}
 				logger.Errorf("copy link failed: %s", err)
@@ -628,42 +637,29 @@ func deleteFromDst(tasks chan<- object.Object, dstobj object.Object, config *Con
 	return false
 }
 
-func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, config *Config) error {
+func startSingleProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, config *Config) error {
 	start, end := config.Start, config.End
-	logger.Infof("Syncing from %s to %s", src, dst)
-	if start != "" {
-		logger.Infof("first key: %q", start)
-	}
-	if end != "" {
-		logger.Infof("last key: %q", end)
-	}
 	logger.Debugf("maxResults: %d, defaultPartSize: %d, maxBlock: %d", maxResults, defaultPartSize, maxBlock)
 
-	srckeys, err := ListAll(src, start, end)
+	srckeys, err := ListAll(src, prefix, start, end, !config.Links)
 	if err != nil {
 		return fmt.Errorf("list %s: %s", src, err)
 	}
 
-	dstkeys, err := ListAll(dst, start, end)
+	dstkeys, err := ListAll(dst, prefix, start, end, !config.Links)
 	if err != nil {
 		return fmt.Errorf("list %s: %s", dst, err)
 	}
-	if len(config.Exclude) > 0 {
-		rules := parseIncludeRules(os.Args)
-		if runtime.GOOS == "windows" && (strings.HasPrefix(src.String(), "file:") || strings.HasPrefix(dst.String(), "file:")) {
-			for _, r := range rules {
-				r.pattern = strings.Replace(r.pattern, "\\", "/", -1)
-			}
-		}
-		srckeys = filter(srckeys, rules)
-		dstkeys = filter(dstkeys, rules)
-	}
-	go produce(tasks, src, dst, srckeys, dstkeys, config)
+
+	produce(tasks, src, dst, srckeys, dstkeys, config)
 	return nil
 }
 
 func produce(tasks chan<- object.Object, src, dst object.ObjectStorage, srckeys, dstkeys <-chan object.Object, config *Config) {
-	defer close(tasks)
+	if len(config.rules) > 0 {
+		srckeys = filter(srckeys, config.rules)
+		dstkeys = filter(dstkeys, config.rules)
+	}
 	var dstobj object.Object
 	for obj := range srckeys {
 		if obj == nil {
@@ -710,8 +706,19 @@ func produce(tasks chan<- object.Object, src, dst object.ObjectStorage, srckeys,
 
 		// FIXME: there is a race when source is modified during coping
 		if dstobj == nil || obj.Key() < dstobj.Key() {
+			if config.Existing {
+				skipped.Increment()
+				handled.Increment()
+				continue
+			}
 			tasks <- obj
 		} else { // obj.key == dstobj.key
+			if config.IgnoreExisting {
+				skipped.Increment()
+				handled.Increment()
+				dstobj = nil
+				continue
+			}
 			if config.ForceUpdate ||
 				(config.Update && obj.Mtime().Unix() > dstobj.Mtime().Unix()) ||
 				(!config.Update && obj.Size() != dstobj.Size()) {
@@ -760,9 +767,17 @@ func parseIncludeRules(args []string) (rules []rule) {
 			a = a[1:]
 		}
 		if l-1 > i && (a == "-include" || a == "-exclude") {
+			if _, err := path.Match(args[i+1], "xxxx"); err != nil {
+				logger.Warnf("ignore invalid pattern: %s %s", a, args[i+1])
+				continue
+			}
 			rules = append(rules, rule{pattern: args[i+1], include: a == "-include"})
 		} else if strings.HasPrefix(a, "-include=") || strings.HasPrefix(a, "-exclude=") {
 			if s := strings.Split(a, "="); len(s) == 2 && s[1] != "" {
+				if _, err := path.Match(s[1], "xxxx"); err != nil {
+					logger.Warnf("ignore invalid pattern: %s", a)
+					continue
+				}
 				rules = append(rules, rule{pattern: s[1], include: strings.HasPrefix(a, "-include=")})
 			}
 		}
@@ -819,7 +834,7 @@ func matchKey(rules []rule, key string) bool {
 			suffix := suffixForPattern(prefix+s, rule.pattern)
 			ok, err := path.Match(rule.pattern, suffix)
 			if err != nil {
-				panic(fmt.Sprintf("match %s with %s: %v", rule.pattern, suffix, err))
+				logger.Fatalf("match %s with %s: %v", rule.pattern, suffix, err)
 			}
 			if ok {
 				if rule.include {
@@ -831,6 +846,121 @@ func matchKey(rules []rule, key string) bool {
 		}
 	}
 	return true
+}
+
+func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.Object, followLink bool) (chan object.Object, error) {
+	var total []object.Object
+	var marker string
+	for {
+		objs, err := store.List(prefix, marker, "/", maxResults, followLink)
+		if err != nil {
+			return nil, err
+		}
+		if len(objs) == 0 {
+			break
+		}
+		total = append(total, objs...)
+		marker = objs[len(objs)-1].Key()
+		if marker == "" {
+			break
+		}
+	}
+	srckeys := make(chan object.Object, 1000)
+	go func() {
+		defer close(srckeys)
+		for _, o := range total {
+			if o.IsDir() && o.Key() > prefix {
+				if cp != nil {
+					cp <- o
+				}
+			} else {
+				srckeys <- o
+			}
+		}
+	}()
+	return srckeys, nil
+}
+
+func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, config *Config) error {
+	if config.ListThreads <= 1 || strings.Count(prefix, "/") >= config.ListDepth {
+		return startSingleProducer(tasks, src, dst, prefix, config)
+	}
+
+	commonPrefix := make(chan object.Object, 1000)
+	done := make(chan bool)
+	go func() {
+		defer close(done)
+		var mu sync.Mutex
+		processing := make(map[string]bool)
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		for c := range commonPrefix {
+			mu.Lock()
+			if processing[c.Key()] {
+				mu.Unlock()
+				continue
+			}
+			processing[c.Key()] = true
+			mu.Unlock()
+
+			if len(config.rules) > 0 && !matchKey(config.rules, c.Key()) {
+				logger.Infof("exclude prefix %s", c.Key())
+				continue
+			}
+			if c.Key() < config.Start {
+				logger.Infof("ingore prefix %s", c.Key())
+				continue
+			}
+			if config.End != "" && c.Key() > config.End {
+				logger.Infof("ignore prefix %s", c.Key())
+				continue
+			}
+			select {
+			case config.concurrentList <- 1:
+				wg.Add(1)
+				go func(prefix string) {
+					defer wg.Done()
+					err := startProducer(tasks, src, dst, prefix, config)
+					if err != nil {
+						logger.Fatalf("list prefix %s: %s", prefix, err)
+					}
+					<-config.concurrentList
+				}(c.Key())
+			default:
+				err := startProducer(tasks, src, dst, c.Key(), config)
+				if err != nil {
+					logger.Fatalf("list prefix %s: %s", c.Key(), err)
+				}
+			}
+
+		}
+	}()
+
+	srckeys, err := listCommonPrefix(src, prefix, commonPrefix, !config.Links)
+	if err == utils.ENOTSUP {
+		return startSingleProducer(tasks, src, dst, prefix, config)
+	} else if err != nil {
+		return fmt.Errorf("list %s with delimiter: %s", src, err)
+	}
+	var dcp chan object.Object
+	if config.DeleteDst {
+		dcp = commonPrefix // search common prefix in dst
+	}
+	dstkeys, err := listCommonPrefix(dst, prefix, dcp, !config.Links)
+	if err == utils.ENOTSUP {
+		return startSingleProducer(tasks, src, dst, prefix, config)
+	} else if err != nil {
+		return fmt.Errorf("list %s with delimiter: %s", dst, err)
+	}
+	// sync returned objects
+	produce(tasks, src, dst, srckeys, dstkeys, config)
+	// consume all the keys from dst
+	for range dstkeys {
+	}
+	close(commonPrefix)
+
+	<-done
+	return nil
 }
 
 // Sync syncs all the keys between to object storage
@@ -861,14 +991,29 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		limiter = ratelimit.NewBucketWithRate(bps, int64(bps)*3)
 	}
 
-	progress := utils.NewProgress(config.Verbose || config.Quiet || config.Manager != "", true)
+	progress := utils.NewProgress(config.Verbose || config.Quiet || config.Manager != "")
 	handled = progress.AddCountBar("Scanned objects", 0)
-	copied = progress.AddCountSpinner("Copied objects")
-	copiedBytes = progress.AddByteSpinner("Copied objects")
-	checkedBytes = progress.AddByteSpinner("Checked objects")
-	deleted = progress.AddCountSpinner("Deleted objects")
 	skipped = progress.AddCountSpinner("Skipped objects")
-	failed = progress.AddCountSpinner("Failed objects")
+	pending = progress.AddCountSpinner("Pending objects")
+	copied = progress.AddCountSpinner("Copied objects")
+	copiedBytes = progress.AddByteSpinner("Copied bytes")
+	if config.CheckAll || config.CheckNew {
+		checked = progress.AddCountSpinner("Checked objects")
+		checkedBytes = progress.AddByteSpinner("Checked bytes")
+	}
+	if config.DeleteSrc || config.DeleteDst {
+		deleted = progress.AddCountSpinner("Deleted objects")
+	}
+	if !config.Dry {
+		failed = progress.AddCountSpinner("Failed objects")
+	}
+	go func() {
+		for {
+			pending.SetCurrent(int64(len(tasks)))
+			time.Sleep(time.Millisecond * 100)
+		}
+	}()
+
 	for i := 0; i < config.Threads; i++ {
 		wg.Add(1)
 		go func() {
@@ -877,18 +1022,37 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}()
 	}
 
-	if config.Manager == "" {
-		err := startProducer(tasks, src, dst, config)
-		if err != nil {
-			return err
+	if len(config.Exclude) > 0 {
+		rules := parseIncludeRules(os.Args)
+		if runtime.GOOS == "windows" && (strings.HasPrefix(src.String(), "file:") || strings.HasPrefix(dst.String(), "file:")) {
+			for _, r := range rules {
+				r.pattern = strings.Replace(r.pattern, "\\", "/", -1)
+			}
 		}
+		config.rules = rules
+	}
+
+	if config.Manager == "" {
 		if len(config.Workers) > 0 {
-			addr, err := startManager(tasks)
+			addr, err := startManager(config, tasks)
 			if err != nil {
 				return err
 			}
 			launchWorker(addr, config, &wg)
 		}
+		logger.Infof("Syncing from %s to %s", src, dst)
+		if config.Start != "" {
+			logger.Infof("first key: %q", config.Start)
+		}
+		if config.End != "" {
+			logger.Infof("last key: %q", config.End)
+		}
+		config.concurrentList = make(chan int, config.ListThreads)
+		err := startProducer(tasks, src, dst, "", config)
+		if err != nil {
+			return err
+		}
+		close(tasks)
 	} else {
 		go fetchJobs(tasks, config)
 		go func() {
@@ -900,17 +1064,29 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	}
 
 	wg.Wait()
+	pending.SetCurrent(0)
 	progress.Done()
 
 	if config.Manager == "" {
-		logger.Infof("Found: %d, copied: %d (%s), checked: %s, deleted: %d, skipped: %d, failed: %d",
-			handled.Current(), copied.Current(), formatSize(copiedBytes.Current()), formatSize(checkedBytes.Current()),
-			deleted.Current(), skipped.Current(), failed.Current())
+		msg := fmt.Sprintf("Found: %d, skipped: %d, copied: %d (%s)",
+			handled.Current(), skipped.Current(), copied.Current(), formatSize(copiedBytes.Current()))
+		if checked != nil {
+			msg += fmt.Sprintf(", checked: %d (%s)", checked.Current(), formatSize(checkedBytes.Current()))
+		}
+		if deleted != nil {
+			msg += fmt.Sprintf(", deleted: %d", deleted.Current())
+		}
+		if failed != nil {
+			msg += fmt.Sprintf(", failed: %d", failed.Current())
+		}
+		logger.Info(msg)
 	} else {
 		sendStats(config.Manager)
 	}
-	if n := failed.Current(); n > 0 {
-		return fmt.Errorf("Failed to handle %d objects", n)
+	if failed != nil {
+		if n := failed.Current(); n > 0 {
+			return fmt.Errorf("Failed to handle %d objects", n)
+		}
 	}
 	return nil
 }

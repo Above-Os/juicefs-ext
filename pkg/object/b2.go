@@ -78,6 +78,7 @@ func (c *b2client) Head(key string) (Object, error) {
 		f.ContentLength,
 		time.Unix(f.UploadTimestamp/1000, 0),
 		strings.HasSuffix(f.Name, "/"),
+		"",
 	}, nil
 }
 
@@ -104,7 +105,8 @@ func (c *b2client) Copy(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.bucket.CopyFile(f.ID, dst, "", backblaze.FileMetaDirectiveCopy)
+	// destinationBucketId must be set,otherwise it will return 400 Bad destinationBucketId
+	_, err = c.bucket.CopyFile(f.ID, dst, c.bucket.ID, backblaze.FileMetaDirectiveCopy)
 	return err
 }
 
@@ -120,7 +122,7 @@ func (c *b2client) Delete(key string) error {
 	return err
 }
 
-func (c *b2client) List(prefix, marker string, limit int64) ([]Object, error) {
+func (c *b2client) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
@@ -128,7 +130,7 @@ func (c *b2client) List(prefix, marker string, limit int64) ([]Object, error) {
 		marker = c.nextMarker
 		c.nextMarker = ""
 	}
-	resp, err := c.bucket.ListFileNamesWithPrefix(marker, int(limit), prefix, "")
+	resp, err := c.bucket.ListFileNamesWithPrefix(marker, int(limit), prefix, delimiter)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +144,7 @@ func (c *b2client) List(prefix, marker string, limit int64) ([]Object, error) {
 			f.ContentLength,
 			time.Unix(f.UploadTimestamp/1000, 0),
 			strings.HasSuffix(f.Name, "/"),
+			"",
 		}
 	}
 	c.nextMarker = resp.NextFileName
@@ -171,6 +174,8 @@ func newB2(endpoint, keyID, applicationKey, token string) (ObjectStorage, error)
 	bucket, err := client.Bucket(name)
 	if err != nil {
 		logger.Warnf("access bucket %s: %s", name, err)
+	}
+	if err == nil && bucket == nil {
 		bucket, err = client.CreateBucket(name, "allPrivate")
 		if err != nil {
 			return nil, fmt.Errorf("create bucket %s: %s", name, err)
