@@ -47,13 +47,3 @@ jobs:
         with:
           files: /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
   
-      - name: Release public files
-        uses: softprops/action-gh-release@v1
-        with:
-          name: ${{ steps.get-latest-tag.outputs.tag }} Release
-          tag_name: ${{ steps.get-latest-tag.outputs.tag }}
-          repository: eball/juicefs-ext-public
-          files: |
-            /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
