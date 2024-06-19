@@ -26,24 +26,11 @@ jobs:
         with:
           fallback: latest
 
-      - name: setup release environment
-        run: |-
-          echo 'GITHUB_TOKEN=${{secrets.GITHUB_TOKEN}}' > .release-env
-
-      - name: Build
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools upx-ucl
-          export STATIC=1
-          make juicefs.linux
-
-      - name: Archives
-        run: |
-          mkdir -p /tmp/build
-          tar -zcvf /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz ./juicefs
-  
-      - name: 'Release'
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v3.1.0
         with:
-          files: /tmp/build/juicefs-${{ steps.get-latest-tag.outputs.tag }}-linux-amd64.tar.gz
-  
+          distribution: goreleaser
+          version: v1.18.2
+          args: release --rm-dist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  
